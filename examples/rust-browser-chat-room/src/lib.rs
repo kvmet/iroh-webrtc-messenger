@@ -257,6 +257,26 @@ struct RoomSave {
     hosting: bool,
 }
 
+fn make_invite_url(topic_bytes: [u8; 32], endpoint_id: &str) -> Option<String> {
+    let loc = web_sys::window()?.location();
+    let origin = loc.origin().ok()?;
+    let path = loc.pathname().ok()?;
+    Some(format!("{}{}#{}|{}", origin, path, BASE64.encode(topic_bytes), endpoint_id))
+}
+
+fn copy_to_clipboard(text: &str) {
+    let text = text.to_string();
+    spawn_local(async move {
+        let Some(window) = web_sys::window() else { return };
+        let Ok(nav) = js_sys::Reflect::get(&window, &"navigator".into()) else { return };
+        let Ok(clipboard) = js_sys::Reflect::get(&nav, &"clipboard".into()) else { return };
+        let Ok(write_text) = js_sys::Reflect::get(&clipboard, &"writeText".into()) else { return };
+        let func: js_sys::Function = write_text.unchecked_into();
+        let Ok(promise) = js_sys::Reflect::apply(&func, &clipboard, &js_sys::Array::of1(&text.into())) else { return };
+        let _ = JsFuture::from(promise.unchecked_into::<js_sys::Promise>()).await;
+    });
+}
+
 async fn save_rooms(rooms: &[RoomState], key_bytes: &[u8; 32]) {
     let saves: Vec<RoomSave> = rooms.iter().map(|r| RoomSave {
         topic_b64: BASE64.encode(r.topic_bytes),
@@ -920,21 +940,27 @@ fn chat_room(props: &ChatRoomProps) -> Html {
     let room_name_input = use_state(|| String::from("general"));
     let msg_input = use_state(String::new);
     let messages_ref = use_node_ref();
+    let show_host_modal = use_state(|| false);
+    let show_join_modal = use_state(|| false);
+    let open_menu: UseStateHandle<Option<String>> = use_state(|| None);
+
+    // Auto-open join modal when arriving via invite link
+    use_effect_with((), {
+        let host_input = host_input.clone();
+        let show_join_modal = show_join_modal.clone();
+        move |_| {
+            if !(*host_input).is_empty() {
+                show_join_modal.set(true);
+            }
+            || ()
+        }
+    });
 
     let active_room = props.state.active_topic.as_ref()
         .and_then(|tid| props.state.rooms.iter().find(|r| &r.topic_id == tid));
     let active_topic_id = props.state.active_topic.clone().unwrap_or_default();
     let can_send = active_room.map_or(false, |r| r.joined);
 
-    let share_url: Option<String> = active_room
-        .filter(|r| r.mode == RoomMode::Hosting)
-        .and_then(|r| {
-            let topic_b64 = BASE64.encode(r.topic_bytes);
-            let loc = web_sys::window()?.location();
-            let origin = loc.origin().ok()?;
-            let path = loc.pathname().ok()?;
-            Some(format!("{}{}#{}|{}", origin, path, topic_b64, props.endpoint_id))
-        });
 
     // Save rooms whenever the room list changes (only if identity is persisted)
     use_effect_with(props.state.rooms.len(), {
@@ -995,6 +1021,7 @@ fn chat_room(props: &ChatRoomProps) -> Html {
     let on_host_click = {
         let name = name.clone();
         let room_name_input = room_name_input.clone();
+        let show_host_modal = show_host_modal.clone();
         let cb = props.on_host.clone();
         Callback::from(move |_: MouseEvent| {
             let mut topic_bytes = [0u8; 32];
@@ -1005,17 +1032,20 @@ fn chat_room(props: &ChatRoomProps) -> Html {
             }
             let topic_b64 = BASE64.encode(topic_bytes);
             cb.emit((topic_b64, (*room_name_input).clone(), (*name).clone()));
+            show_host_modal.set(false);
         })
     };
     let on_join_click = {
         let name = name.clone();
         let host_input = host_input.clone();
         let room_name_input = room_name_input.clone();
+        let show_join_modal = show_join_modal.clone();
         let cb = props.on_join.clone();
         Callback::from(move |_: MouseEvent| {
             let h = (*host_input).trim().to_string();
             if !h.is_empty() {
                 cb.emit((h, (*room_name_input).clone(), (*name).clone()));
+                show_join_modal.set(false);
             }
         })
     };
@@ -1046,12 +1076,6 @@ fn chat_room(props: &ChatRoomProps) -> Html {
         })
     };
 
-    let on_share_click = Callback::from(|e: MouseEvent| {
-        if let Some(el) = e.target().and_then(|t| t.dyn_into::<web_sys::HtmlInputElement>().ok()) {
-            el.select();
-        }
-    });
-
     html! {
         <div class="aim-window flex flex-col h-full">
             <div class="aim-titlebar">
@@ -1060,20 +1084,76 @@ fn chat_room(props: &ChatRoomProps) -> Html {
                     { active_room.map_or_else(|| "WebRTC P2P".into(), |r| format!("#{} · WebRTC P2P", r.name)) }
                 </span>
             </div>
+
+            // ── Modals ────────────────────────────────────────────────────────
+            if *show_host_modal {
+                <div class="fixed inset-0 flex items-center justify-center" style="z-index:50">
+                    <div class="absolute inset-0 bg-black opacity-30"
+                        onclick={Callback::from({let s = show_host_modal.clone(); move |_: MouseEvent| s.set(false)})} />
+                    <div class="aim-window w-72 relative">
+                        <div class="aim-titlebar">
+                            {"New Room"}
+                            <button class="ml-auto aim-btn px-1 py-0 text-xs"
+                                onclick={Callback::from({let s = show_host_modal.clone(); move |_: MouseEvent| s.set(false)})}>
+                                {"x"}
+                            </button>
+                        </div>
+                        <div class="p-3">
+                            <div class="text-xs font-bold mb-1">{"Room name"}</div>
+                            <input type="text" class="aim-input mb-3"
+                                value={(*room_name_input).clone()} oninput={on_room_name_input.clone()}
+                                placeholder="general" />
+                            <div class="flex gap-1 justify-end">
+                                <button class="aim-btn"
+                                    onclick={Callback::from({let s = show_host_modal.clone(); move |_: MouseEvent| s.set(false)})}>
+                                    {"Cancel"}
+                                </button>
+                                <button class="aim-btn" onclick={on_host_click}>{"Create"}</button>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            }
+
+            if *show_join_modal {
+                <div class="fixed inset-0 flex items-center justify-center" style="z-index:50">
+                    <div class="absolute inset-0 bg-black opacity-30"
+                        onclick={Callback::from({let s = show_join_modal.clone(); move |_: MouseEvent| s.set(false)})} />
+                    <div class="aim-window w-72 relative">
+                        <div class="aim-titlebar">
+                            {"Join Room"}
+                            <button class="ml-auto aim-btn px-1 py-0 text-xs"
+                                onclick={Callback::from({let s = show_join_modal.clone(); move |_: MouseEvent| s.set(false)})}>
+                                {"x"}
+                            </button>
+                        </div>
+                        <div class="p-3">
+                            <div class="text-xs font-bold mb-1">{"Invite link"}</div>
+                            <input type="text" class="aim-input text-[10px] font-mono mb-3"
+                                value={(*host_input).clone()} oninput={on_host_input}
+                                placeholder="paste invite link" spellcheck="false" />
+                            <div class="text-xs font-bold mb-1">
+                                {"Room name "}
+                                <span class="font-normal text-gray-500">{"(optional)"}</span>
+                            </div>
+                            <input type="text" class="aim-input mb-3"
+                                value={(*room_name_input).clone()} oninput={on_room_name_input.clone()}
+                                placeholder="general" />
+                            <div class="flex gap-1 justify-end">
+                                <button class="aim-btn"
+                                    onclick={Callback::from({let s = show_join_modal.clone(); move |_: MouseEvent| s.set(false)})}>
+                                    {"Cancel"}
+                                </button>
+                                <button class="aim-btn" onclick={on_join_click}>{"Join"}</button>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            }
+
             <div class="flex flex-1 min-h-0">
                 // ── Left sidebar ──────────────────────────────────────────────
                 <div class="w-52 shrink-0 border-r-2 border-r-[#808080] flex flex-col overflow-hidden">
-
-                    <div class="p-2 border-b border-[#808080]">
-                        <div class="aim-section-label">{"Screen Name"}</div>
-                        <input
-                            type="text"
-                            class="aim-input"
-                            value={(*name).clone()}
-                            oninput={on_name_input}
-                            maxlength="32"
-                        />
-                    </div>
 
                     if !props.persistent {
                         <div class="p-1 px-2 bg-[#ffff80] border-b border-[#808080] text-[10px] leading-tight">
@@ -1082,26 +1162,20 @@ fn chat_room(props: &ChatRoomProps) -> Html {
                     }
 
                     <div class="p-2 border-b border-[#808080]">
-                        <div class="aim-section-label">{"New Chat"}</div>
-                        <input
-                            type="text"
-                            class="aim-input mb-1"
-                            placeholder="room name"
-                            value={(*room_name_input).clone()}
-                            oninput={on_room_name_input}
-                        />
-                        <input
-                            type="text"
-                            class="aim-input text-[10px] font-mono mb-1"
-                            placeholder="paste invite to join"
-                            value={(*host_input).clone()}
-                            oninput={on_host_input}
-                            spellcheck="false"
-                        />
-                        <div class="flex gap-1">
-                            <button class="aim-btn flex-1 px-1" onclick={on_host_click}>{"Host"}</button>
-                            <button class="aim-btn flex-1 px-1" onclick={on_join_click}>{"Join"}</button>
-                        </div>
+                        <div class="aim-section-label">{"Screen Name"}</div>
+                        <input type="text" class="aim-input" value={(*name).clone()}
+                            oninput={on_name_input} maxlength="32" />
+                    </div>
+
+                    <div class="p-2 border-b border-[#808080] flex gap-1">
+                        <button class="aim-btn flex-1 px-1"
+                            onclick={Callback::from({let s = show_host_modal.clone(); move |_: MouseEvent| s.set(true)})}>
+                            {"New Room"}
+                        </button>
+                        <button class="aim-btn flex-1 px-1"
+                            onclick={Callback::from({let s = show_join_modal.clone(); move |_: MouseEvent| s.set(true)})}>
+                            {"Join Room"}
+                        </button>
                     </div>
 
                     <div class="flex-1 overflow-auto p-2 flex flex-col gap-2">
@@ -1112,17 +1186,43 @@ fn chat_room(props: &ChatRoomProps) -> Html {
                                     { for props.state.rooms.iter().map(|room| {
                                         let is_active = props.state.active_topic.as_deref() == Some(room.topic_id.as_str());
                                         let tid = room.topic_id.clone();
-                                        let cb = props.on_switch_room.clone();
-                                        let label = format!("#{}", room.name);
-                                        let count = room.participants.len();
+                                        let switch_cb = props.on_switch_room.clone();
+                                        let menu_tid = tid.clone();
+                                        let open_menu_h = open_menu.clone();
+                                        let is_menu_open = open_menu.as_deref() == Some(room.topic_id.as_str());
+                                        let invite_url = make_invite_url(room.topic_bytes, &props.endpoint_id)
+                                            .unwrap_or_default();
                                         html! {
-                                            <li
-                                                class={if is_active { "aim-buddy bg-[#000080] text-white font-bold" } else { "aim-buddy" }}
-                                                onclick={Callback::from(move |_: MouseEvent| cb.emit(tid.clone()))}
-                                            >
-                                                {label}
-                                                if count > 0 {
-                                                    <span class="ml-1 opacity-70">{format!("({})", count)}</span>
+                                            <li class="relative">
+                                                <div class={if is_active { "flex items-center bg-[#000080] text-white" } else { "flex items-center" }}>
+                                                    <span class="flex-1 aim-buddy truncate"
+                                                        onclick={Callback::from(move |_: MouseEvent| switch_cb.emit(tid.clone()))}>
+                                                        {format!("#{}", room.name)}
+                                                        if room.participants.len() > 0 {
+                                                            <span class="ml-1 opacity-70 text-[10px]">
+                                                                {format!("({})", room.participants.len())}
+                                                            </span>
+                                                        }
+                                                    </span>
+                                                    <button class="px-1 text-[11px] opacity-50 hover:opacity-100 shrink-0"
+                                                        onclick={Callback::from(move |e: MouseEvent| {
+                                                            e.stop_propagation();
+                                                            open_menu_h.set(if is_menu_open { None } else { Some(menu_tid.clone()) });
+                                                        })}>
+                                                        {"..."}
+                                                    </button>
+                                                </div>
+                                                if open_menu.as_deref() == Some(room.topic_id.as_str()) {
+                                                    <div class="aim-window absolute right-0 z-10 min-w-[140px]" style="top:100%">
+                                                        <button class="block w-full text-left aim-buddy text-[11px]"
+                                                            onclick={Callback::from({
+                                                                let url = invite_url.clone();
+                                                                let om = open_menu.clone();
+                                                                move |_: MouseEvent| { copy_to_clipboard(&url); om.set(None); }
+                                                            })}>
+                                                            {"Copy invite link"}
+                                                        </button>
+                                                    </div>
                                                 }
                                             </li>
                                         }
@@ -1144,29 +1244,14 @@ fn chat_room(props: &ChatRoomProps) -> Html {
                                     })}
                                 </ul>
                             </div>
-                            if let Some(url) = share_url.clone() {
-                                <div>
-                                    <div class="aim-section-label">{"Invite Link"}</div>
-                                    <input
-                                        type="text"
-                                        class="aim-input text-[10px] font-mono"
-                                        readonly=true
-                                        value={url}
-                                        onclick={on_share_click}
-                                    />
-                                </div>
-                            }
                         }
                     </div>
 
                     <div class="p-1 border-t border-[#808080] text-[10px] text-gray-600 min-h-5 leading-tight">
                         { active_room.map_or_else(
                             || String::from("No active chat"),
-                            |r| if r.joined {
-                                format!("{} online", r.participants.len() + 1)
-                            } else {
-                                "Connecting…".into()
-                            }
+                            |r| if r.joined { format!("{} online", r.participants.len() + 1) }
+                                else { "Connecting…".into() }
                         )}
                     </div>
                 </div>
