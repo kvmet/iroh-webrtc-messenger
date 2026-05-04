@@ -337,6 +337,7 @@ enum ChatGossipEvent {
     NeighborDown { topic: String, endpoint: String },
     Chat { topic: String, from_endpoint: String, from_name: String, text: String },
     System { topic: String, text: String },
+    Identify { topic: String, endpoint: String, name: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -431,9 +432,10 @@ impl BrowserProtocol for ChatGossipProtocol {
                                 {
                                     match wire {
                                         ChatWireMessage::AboutMe { endpoint, name } => {
-                                            let _ = events.send(ChatGossipEvent::System {
+                                            let _ = events.send(ChatGossipEvent::Identify {
                                                 topic: topic_for_task.clone(),
-                                                text: format!("{name} joined ({endpoint})"),
+                                                endpoint,
+                                                name,
                                             });
                                         }
                                         ChatWireMessage::Chat { from_endpoint, from_name, text } => {
@@ -563,6 +565,7 @@ struct RoomState {
     mode: RoomMode,
     messages: Vec<ChatMsg>,
     participants: Vec<String>,
+    names: HashMap<String, String>,
     joined: bool,
     bootstrap_peers: Vec<String>,
 }
@@ -637,6 +640,7 @@ fn app() -> Html {
                                     mode: if s.hosting { RoomMode::Hosting } else { RoomMode::Joined },
                                     messages: vec![],
                                     participants: vec![],
+                                    names: HashMap::new(),
                                     joined: false,
                                     bootstrap_peers: s.bootstrap_peers,
                                 }
@@ -1087,6 +1091,7 @@ fn chat_room(props: &ChatRoomProps) -> Html {
         let cb = props.on_send.clone();
         let tid = active_topic_id.clone();
         move || {
+            if !can_send { return; }
             let text = (*msg_input).trim().to_string();
             if !text.is_empty() {
                 msg_input.set(String::new());
@@ -1321,8 +1326,11 @@ fn chat_room(props: &ChatRoomProps) -> Html {
                                         {(*name).clone()}{" (me)"}
                                     </li>
                                     { for room.participants.iter().map(|ep| {
-                                        let short = ep.chars().take(20).collect::<String>();
-                                        html! { <li class="aim-buddy">{short}</li> }
+                                        let display = room.names.get(ep).cloned().unwrap_or_else(|| {
+                                            let short: String = ep.chars().take(20).collect();
+                                            format!("{short}…")
+                                        });
+                                        html! { <li class="aim-buddy">{display}</li> }
                                     })}
                                 </ul>
                             </div>
@@ -1332,8 +1340,12 @@ fn chat_room(props: &ChatRoomProps) -> Html {
                     <div class="p-1 border-t border-[#808080] text-[10px] text-gray-600 min-h-5 leading-tight">
                         { active_room.map_or_else(
                             || String::from("No active chat"),
-                            |r| if r.joined { format!("{} online", r.participants.len() + 1) }
-                                else { "Connecting…".into() }
+                            |r| match (r.joined, r.mode, r.participants.len()) {
+                                (false, _, _) => format!("Connecting to #{}…", r.name),
+                                (true, RoomMode::Hosting, 0) => format!("Hosting #{} · waiting for guests", r.name),
+                                (true, RoomMode::Joined, 0) => format!("In #{} · no peers connected", r.name),
+                                (true, _, n) => format!("In #{} · {} online", r.name, n + 1),
+                            }
                         )}
                     </div>
                 </div>
@@ -1364,10 +1376,25 @@ fn chat_room(props: &ChatRoomProps) -> Html {
                         }}
                     </div>
 
+                    if let Some(room) = active_room {
+                        if !room.joined {
+                            <div class="px-2 py-1 bg-[#ffffc0] border-t border-[#808080] text-[10px] text-gray-700">
+                                {format!("Connecting to #{}…", room.name)}
+                            </div>
+                        }
+                    }
                     <div class="border-t-2 border-t-[#808080] p-2 flex gap-2 items-end bg-[#c0c0c0]">
                         <textarea
-                            class="aim-inset flex-1 p-1 text-sm h-16 resize-none font-[Arial,sans-serif]"
-                            placeholder="Type a message… (Enter to send, Shift+Enter for newline)"
+                            class={classes!(
+                                "aim-inset", "flex-1", "p-1", "text-sm", "h-16", "resize-none",
+                                "font-[Arial,sans-serif]",
+                                if !can_send { "opacity-60" } else { "" }
+                            )}
+                            placeholder={
+                                if active_room.is_none() { "Host or join a chat to start typing" }
+                                else if !can_send { "Connecting…" }
+                                else { "Type a message… (Enter to send, Shift+Enter for newline)" }
+                            }
                             value={(*msg_input).clone()}
                             oninput={on_msg_input}
                             onkeydown={on_send_keydown}
@@ -1423,20 +1450,23 @@ async fn gossip_event_loop(
                     if !r.participants.contains(&endpoint) {
                         r.participants.push(endpoint.clone());
                     }
-                    let short = endpoint.chars().take(12).collect::<String>();
-                    r.messages.push(sys_msg(&format!("*** {short}… joined")));
                 }
             }
             ChatGossipEvent::NeighborDown { topic, endpoint } => {
                 if let Some(r) = s.rooms.iter_mut().find(|r| r.topic_id == topic) {
                     r.participants.retain(|p| p != &endpoint);
-                    let short = endpoint.chars().take(12).collect::<String>();
-                    r.messages.push(sys_msg(&format!("*** {short}… left")));
+                    let display = r.names.get(&endpoint).cloned()
+                        .unwrap_or_else(|| {
+                            let short: String = endpoint.chars().take(12).collect();
+                            format!("{short}…")
+                        });
+                    r.messages.push(sys_msg(&format!("*** {display} left")));
                 }
             }
             ChatGossipEvent::Chat { topic, from_endpoint, from_name, text } => {
                 if from_endpoint != local_ep {
                     if let Some(r) = s.rooms.iter_mut().find(|r| r.topic_id == topic) {
+                        r.names.insert(from_endpoint.clone(), from_name.clone());
                         r.messages.push(ChatMsg { from_endpoint, from_name, text, is_system: false });
                     }
                 }
@@ -1444,6 +1474,16 @@ async fn gossip_event_loop(
             ChatGossipEvent::System { topic, text } => {
                 if let Some(r) = s.rooms.iter_mut().find(|r| r.topic_id == topic) {
                     r.messages.push(sys_msg(&text));
+                }
+            }
+            ChatGossipEvent::Identify { topic, endpoint, name } => {
+                if endpoint == local_ep { state.set(s); continue; }
+                if let Some(r) = s.rooms.iter_mut().find(|r| r.topic_id == topic) {
+                    let was_new = !r.names.contains_key(&endpoint);
+                    r.names.insert(endpoint, name.clone());
+                    if was_new {
+                        r.messages.push(sys_msg(&format!("*** {name} joined")));
+                    }
                 }
             }
         }
@@ -1477,6 +1517,7 @@ async fn do_host(
         messages: vec![sys_msg(&format!("*** Hosting #{room_name}. Share the invite link."))],
         participants: vec![],
         joined: false,
+        names: HashMap::new(),
         bootstrap_peers: vec![],
     });
     s.active_topic = Some(topic_id.clone());
@@ -1522,6 +1563,7 @@ async fn do_join(
         messages: vec![sys_msg(&format!("*** Joining #{room_name}…"))],
         participants: vec![],
         joined: false,
+        names: HashMap::new(),
         bootstrap_peers: vec![host.clone()],
     });
     s.active_topic = Some(topic_id.clone());
