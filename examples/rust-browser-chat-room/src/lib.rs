@@ -345,6 +345,15 @@ async fn load_profile(key_bytes: &[u8; 32]) -> Profile {
 const MAX_WIRE_BYTES: usize = 8192;
 const MAX_NAME_CHARS: usize = 32;
 const MAX_TEXT_CHARS: usize = 4000;
+const MAX_BOOTSTRAP_PEERS: usize = 20;
+
+fn add_known_peer(peers: &mut Vec<String>, ep: &str) {
+    if peers.iter().any(|p| p == ep) { return; }
+    if peers.len() >= MAX_BOOTSTRAP_PEERS {
+        peers.remove(0);
+    }
+    peers.push(ep.to_string());
+}
 
 fn truncate_chars(s: &mut String, max: usize) {
     if s.chars().count() > max {
@@ -671,8 +680,9 @@ impl Reducible for AppState {
             Action::NeighborUp { topic, endpoint } => {
                 if let Some(r) = s.rooms.iter_mut().find(|r| r.topic_id == topic) {
                     if !r.participants.contains(&endpoint) {
-                        r.participants.push(endpoint);
+                        r.participants.push(endpoint.clone());
                     }
+                    add_known_peer(&mut r.bootstrap_peers, &endpoint);
                 }
             }
             Action::NeighborDown { topic, endpoint } => {
@@ -700,6 +710,7 @@ impl Reducible for AppState {
             }
             Action::Identify { topic, endpoint, name } => {
                 if let Some(r) = s.rooms.iter_mut().find(|r| r.topic_id == topic) {
+                    add_known_peer(&mut r.bootstrap_peers, &endpoint);
                     // First Identify wins; ignore later renames to prevent impersonation
                     if !r.names.contains_key(&endpoint) {
                         r.names.insert(endpoint, name.clone());
@@ -732,6 +743,7 @@ fn app() -> Html {
     let chat_state = use_reducer(AppState::default);
     let identity_key = use_state(|| [0u8; 32]);
     let passphrase_error: UseStateHandle<Option<String>> = use_state(|| None);
+    let ephemeral = use_state(|| false);
 
     // Check localStorage on mount
     {
@@ -753,6 +765,7 @@ fn app() -> Html {
         let node_ref = node_ref.clone();
         let chat_state = chat_state.clone();
         let identity_key = identity_key.clone();
+        let ephemeral_eff = ephemeral.clone();
         use_effect_with(phase_val, move |p| {
             if let AppPhase::SpawningNode(key_bytes) = p {
                 let key_bytes = *key_bytes;
@@ -760,9 +773,10 @@ fn app() -> Html {
                 let node_ref = node_ref.clone();
                 let chat_state = chat_state.clone();
                 let identity_key = identity_key.clone();
+                let is_ephemeral = *ephemeral_eff;
                 spawn_local(async move {
                     identity_key.set(key_bytes);
-                    let profile = load_profile(&key_bytes).await;
+                    let profile = if is_ephemeral { Profile::default() } else { load_profile(&key_bytes).await };
                     match init_node(key_bytes).await {
                         Ok(handle) => {
                             let gossip = handle.gossip.clone();
@@ -850,8 +864,17 @@ fn app() -> Html {
                     phase.set(AppPhase::NewUser);
                 })
             };
+            let on_ephemeral = {
+                let phase = phase.clone();
+                let ephemeral = ephemeral.clone();
+                Callback::from(move |_: ()| {
+                    let kb = SecretKey::generate().to_bytes();
+                    ephemeral.set(true);
+                    phase.set(AppPhase::SpawningNode(kb));
+                })
+            };
             let error = (*passphrase_error).clone();
-            html! { <PassphraseGate {on_submit} {on_forget} {error} /> }
+            html! { <PassphraseGate {on_submit} {on_forget} {on_ephemeral} {error} /> }
         }
         AppPhase::NewUser => {
             let on_ready = {
@@ -880,7 +903,8 @@ fn app() -> Html {
             if let Some((endpoint_id, gossip)) = handle_data {
                 let state = (*chat_state).clone();
                 let key_bytes = *identity_key;
-                let persistent = load_stored().is_some();
+                let is_ephemeral = *ephemeral;
+                let persistent = !is_ephemeral && load_stored().is_some();
                 let initial_name = if state.name.is_empty() { stored_name() } else { state.name.clone() };
                 let on_host = {
                     let gossip = gossip.clone();
@@ -924,7 +948,7 @@ fn app() -> Html {
                     })
                 };
                 html! {
-                    <ChatRoom {endpoint_id} {state} {key_bytes} {persistent} {initial_name} {on_host} {on_join} {on_send} {on_switch_room} {on_clear_error} />
+                    <ChatRoom {endpoint_id} {state} {key_bytes} {persistent} ephemeral={is_ephemeral} {initial_name} {on_host} {on_join} {on_send} {on_switch_room} {on_clear_error} />
                 }
             } else {
                 html! { <div class="p-4 text-red-600">{"Error: node handle missing"}</div> }
@@ -947,12 +971,14 @@ fn app() -> Html {
 struct PassphraseGateProps {
     on_submit: Callback<String>,
     on_forget: Callback<()>,
+    on_ephemeral: Callback<()>,
     error: Option<String>,
 }
 
 #[function_component(PassphraseGate)]
 fn passphrase_gate(props: &PassphraseGateProps) -> Html {
     let pass = use_state(String::new);
+    let confirm_forget = use_state(|| false);
 
     let on_input = {
         let pass = pass.clone();
@@ -966,8 +992,21 @@ fn passphrase_gate(props: &PassphraseGateProps) -> Html {
         let cb = props.on_submit.clone();
         Callback::from(move |_: MouseEvent| cb.emit((*pass).clone()))
     };
-    let on_forget = {
+    let on_forget_click = {
+        let confirm_forget = confirm_forget.clone();
+        Callback::from(move |_: MouseEvent| confirm_forget.set(true))
+    };
+    let on_forget_confirmed = {
         let cb = props.on_forget.clone();
+        let confirm_forget = confirm_forget.clone();
+        Callback::from(move |_: MouseEvent| { confirm_forget.set(false); cb.emit(()); })
+    };
+    let on_forget_cancel = {
+        let confirm_forget = confirm_forget.clone();
+        Callback::from(move |_: MouseEvent| confirm_forget.set(false))
+    };
+    let on_ephemeral = {
+        let cb = props.on_ephemeral.clone();
         Callback::from(move |_: MouseEvent| cb.emit(()))
     };
     let on_keydown = {
@@ -982,6 +1021,23 @@ fn passphrase_gate(props: &PassphraseGateProps) -> Html {
 
     html! {
         <div class="flex h-full items-center justify-center">
+            if *confirm_forget {
+                <div class="fixed inset-0 flex items-center justify-center" style="z-index:50">
+                    <div class="absolute inset-0 bg-black opacity-30" onclick={on_forget_cancel.clone()} />
+                    <div class="aim-window w-80 relative">
+                        <div class="aim-titlebar">{"Delete saved data?"}</div>
+                        <div class="p-3">
+                            <p class="text-xs mb-3">
+                                {"This will permanently erase your identity, screen name, and all saved chats from this device. This cannot be undone."}
+                            </p>
+                            <div class="flex gap-1 justify-end">
+                                <button class="aim-btn" onclick={on_forget_cancel}>{"Cancel"}</button>
+                                <button class="aim-btn" onclick={on_forget_confirmed}>{"Yes, delete"}</button>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            }
             <div class="aim-window w-80">
                 <div class="aim-titlebar">{"🔵 Iroh Messenger"}</div>
                 <div class="p-4">
@@ -1000,8 +1056,14 @@ fn passphrase_gate(props: &PassphraseGateProps) -> Html {
                     }
                     <button class="aim-btn w-full" onclick={on_sign_on}>{"Sign On"}</button>
                     <button
-                        class="mt-3 block text-xs text-blue-700 underline cursor-pointer bg-transparent border-0 p-0"
-                        onclick={on_forget}
+                        class="mt-3 block w-full text-xs text-gray-700 cursor-pointer bg-transparent border-0 p-0 underline"
+                        onclick={on_ephemeral}
+                    >
+                        {"Sign in for this session only (ephemeral)"}
+                    </button>
+                    <button
+                        class="mt-2 block text-xs text-red-700 underline cursor-pointer bg-transparent border-0 p-0"
+                        onclick={on_forget_click}
                     >
                         {"Not you? Start fresh"}
                     </button>
@@ -1105,7 +1167,10 @@ struct ChatRoomProps {
     endpoint_id: String,
     state: AppState,
     key_bytes: [u8; 32],
+    /// Encrypted profile (rooms + name) is being saved
     persistent: bool,
+    /// One-shot session: nothing saves anywhere
+    ephemeral: bool,
     initial_name: String,
     on_host: Callback<(String, String, String)>,     // (topic_b64, room_name, screen_name)
     on_join: Callback<(String, String, String)>,     // (invite, room_name, screen_name)
@@ -1151,11 +1216,12 @@ fn chat_room(props: &ChatRoomProps) -> Html {
     let active_room = props.state.active_topic.as_ref()
         .and_then(|tid| props.state.rooms.iter().find(|r| &r.topic_id == tid));
     let active_topic_id = props.state.active_topic.clone().unwrap_or_default();
-    let can_send = active_room.map_or(false, |r| r.joined);
+    let can_send = active_room.is_some_and(|r| r.joined);
 
 
     // Save profile (name + rooms) whenever they change, if persistent
-    use_effect_with(((*name).clone(), props.state.rooms.len()), {
+    let bootstrap_total: usize = props.state.rooms.iter().map(|r| r.bootstrap_peers.len()).sum();
+    use_effect_with(((*name).clone(), props.state.rooms.len(), bootstrap_total), {
         let key_bytes = props.key_bytes;
         let rooms = props.state.rooms.clone();
         let n = (*name).clone();
@@ -1184,10 +1250,13 @@ fn chat_room(props: &ChatRoomProps) -> Html {
     let on_name_input = {
         let name = name.clone();
         let persistent = props.persistent;
+        let ephemeral = props.ephemeral;
         Callback::from(move |e: InputEvent| {
             let el: HtmlInputElement = e.target_unchecked_into();
             let v = el.value();
-            if !persistent { save_name(&v); }
+            // Plaintext name save only for unauthenticated (non-ephemeral) sessions;
+            // encrypted save happens via the profile effect when persistent.
+            if !persistent && !ephemeral { save_name(&v); }
             name.set(v);
         })
     };
@@ -1426,7 +1495,7 @@ fn chat_room(props: &ChatRoomProps) -> Html {
 
                     if !props.persistent {
                         <div class="p-1 px-2 bg-[#ffff80] border-b border-[#808080] text-[10px] leading-tight">
-                            {"No passphrase set — chats won't persist across sessions."}
+                            {"Ephemeral session — nothing is being saved."}
                         </div>
                     }
 
@@ -1480,7 +1549,7 @@ fn chat_room(props: &ChatRoomProps) -> Html {
                                                             sidebar_close.set(false);
                                                         })}>
                                                         {format!("#{}", room.name)}
-                                                        if room.participants.len() > 0 {
+                                                        if !room.participants.is_empty() {
                                                             <span class="ml-1 opacity-70 text-[10px]">
                                                                 {format!("({})", room.participants.len())}
                                                             </span>
