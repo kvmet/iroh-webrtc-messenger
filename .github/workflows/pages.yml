@@ -31,19 +31,22 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-            examples/rust-browser-ping-pong/target
+            examples/rust-browser-chat-room/target
           key: cargo-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Install Trunk
         run: cargo install trunk --locked
 
-      - name: Build browser demo
-        working-directory: examples/rust-browser-ping-pong
-        run: trunk build --release --public-url /iroh-webrtc-transport/
+      - name: Build chat room
+        working-directory: examples/rust-browser-chat-room
+        env:
+          CC_wasm32_unknown_unknown: clang
+          AR_wasm32_unknown_unknown: llvm-ar
+        run: trunk build --release --public-url /iroh-webrtc-messenger/
 
       - uses: actions/upload-pages-artifact@v3
         with:
-          path: examples/rust-browser-ping-pong/dist
+          path: docs
 
   deploy:
     needs: build
