@@ -256,6 +256,8 @@ struct RoomSave {
     topic_b64: String,
     name: String,
     hosting: bool,
+    #[serde(default)]
+    bootstrap_peers: Vec<String>,
 }
 
 fn make_invite_url(topic_bytes: [u8; 32], endpoint_id: &str) -> Option<String> {
@@ -291,6 +293,7 @@ async fn save_rooms(rooms: &[RoomState], key_bytes: &[u8; 32]) {
         topic_b64: BASE64.encode(r.topic_bytes),
         name: r.name.clone(),
         hosting: r.mode == RoomMode::Hosting,
+        bootstrap_peers: r.bootstrap_peers.clone(),
     }).collect();
     let Ok(json) = serde_json::to_vec(&saves) else { return };
     let Ok(enc) = encrypt_data(&json, key_bytes).await else { return };
@@ -561,6 +564,7 @@ struct RoomState {
     messages: Vec<ChatMsg>,
     participants: Vec<String>,
     joined: bool,
+    bootstrap_peers: Vec<String>,
 }
 
 #[derive(Clone, PartialEq, Default)]
@@ -621,9 +625,9 @@ fn app() -> Html {
                         Ok(handle) => {
                             let gossip = handle.gossip.clone();
                             let ep = handle.endpoint_id.clone();
+                            let local_name = stored_name();
                             *node_ref.borrow_mut() = Some(handle);
-                            let mut initial = AppState::default();
-                            initial.rooms = saved.into_iter().map(|s| {
+                            let restored: Vec<RoomState> = saved.into_iter().map(|s| {
                                 let topic_bytes: [u8; 32] = BASE64.decode(&s.topic_b64)
                                     .ok().and_then(|b| b.try_into().ok()).unwrap_or([0u8; 32]);
                                 RoomState {
@@ -631,12 +635,28 @@ fn app() -> Html {
                                     topic_bytes,
                                     name: s.name,
                                     mode: if s.hosting { RoomMode::Hosting } else { RoomMode::Joined },
-                                    messages: vec![sys_msg("Restored. Re-join to connect.")],
+                                    messages: vec![],
                                     participants: vec![],
                                     joined: false,
+                                    bootstrap_peers: s.bootstrap_peers,
                                 }
                             }).collect();
+                            let mut initial = AppState::default();
+                            initial.local_name = local_name.clone();
+                            initial.active_topic = restored.first().map(|r| r.topic_id.clone());
+                            initial.rooms = restored.clone();
                             chat_state.set(initial);
+
+                            // Auto-rejoin restored rooms
+                            for r in &restored {
+                                let _ = gossip.send(ChatGossipCommand::Join {
+                                    topic: r.topic_id.clone(),
+                                    peers: r.bootstrap_peers.clone(),
+                                    endpoint: ep.clone(),
+                                    name: local_name.clone(),
+                                }).await;
+                            }
+
                             let state = chat_state.clone();
                             spawn_local(async move {
                                 gossip_event_loop(gossip, ep, state).await;
@@ -1457,6 +1477,7 @@ async fn do_host(
         messages: vec![sys_msg(&format!("*** Hosting #{room_name}. Share the invite link."))],
         participants: vec![],
         joined: false,
+        bootstrap_peers: vec![],
     });
     s.active_topic = Some(topic_id.clone());
     state.set(s);
@@ -1501,6 +1522,7 @@ async fn do_join(
         messages: vec![sys_msg(&format!("*** Joining #{room_name}…"))],
         participants: vec![],
         joined: false,
+        bootstrap_peers: vec![host.clone()],
     });
     s.active_topic = Some(topic_id.clone());
     state.set(s);
