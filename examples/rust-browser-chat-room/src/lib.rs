@@ -6,6 +6,7 @@ use std::{
     sync::{Arc, Mutex as StdMutex},
 };
 
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD as BASE64};
 use bytes::Bytes;
 use iroh::{Endpoint, EndpointId, SecretKey};
 use iroh_gossip::{
@@ -20,21 +21,191 @@ use iroh_webrtc_transport::{
         BrowserWebRtcNodeConfig,
     },
 };
+use js_sys::{Array, Object, Reflect, Uint8Array};
 use n0_future::{StreamExt, task};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex as AsyncMutex, mpsc};
 use wasm_bindgen::{JsCast, prelude::*};
-use wasm_bindgen_futures::spawn_local;
-use web_sys::{
-    Document, Element, HtmlButtonElement, HtmlElement, HtmlInputElement, HtmlTextAreaElement,
-    KeyboardEvent,
-};
+use wasm_bindgen_futures::{JsFuture, spawn_local};
+use web_sys::{HtmlElement, HtmlInputElement, HtmlTextAreaElement, TextEncoder};
+use yew::prelude::*;
 
-const CHAT_TOPIC_BYTES: [u8; 32] = [0x42; 32];
+const STORAGE_ENC: &str = "iroh.id.enc";
+const STORAGE_SALT: &str = "iroh.id.salt";
+const STORAGE_NAME: &str = "iroh.name";
 
-iroh_webrtc_transport::browser_app! {
-    app = start_app => run_app;
+// ── Entry point ───────────────────────────────────────────────────────────────
+
+#[wasm_bindgen]
+pub fn start_app() {
+    console_error_panic_hook::set_once();
+    iroh_webrtc_transport::browser::install_browser_console_tracing();
+    let root = web_sys::window()
+        .expect("no window")
+        .document()
+        .expect("no document")
+        .get_element_by_id("app")
+        .expect("missing #app element");
+    yew::Renderer::<App>::with_root(root).render();
 }
+
+// ── localStorage helpers ──────────────────────────────────────────────────────
+
+fn local_storage() -> std::result::Result<web_sys::Storage, JsValue> {
+    web_sys::window()
+        .ok_or_else(|| JsValue::from_str("no window"))?
+        .local_storage()
+        .map_err(|_| JsValue::from_str("localStorage unavailable"))?
+        .ok_or_else(|| JsValue::from_str("localStorage is null"))
+}
+
+fn load_stored() -> Option<(Vec<u8>, Vec<u8>)> {
+    let s = local_storage().ok()?;
+    let enc = BASE64.decode(s.get_item(STORAGE_ENC).ok()??).ok()?;
+    let salt = BASE64.decode(s.get_item(STORAGE_SALT).ok()??).ok()?;
+    Some((enc, salt))
+}
+
+fn persist(enc: &[u8], salt: &[u8]) -> std::result::Result<(), JsValue> {
+    let s = local_storage()?;
+    s.set_item(STORAGE_ENC, &BASE64.encode(enc))
+        .map_err(|_| JsValue::from_str("write failed"))?;
+    s.set_item(STORAGE_SALT, &BASE64.encode(salt))
+        .map_err(|_| JsValue::from_str("write failed"))
+}
+
+fn forget_stored() {
+    if let Ok(s) = local_storage() {
+        let _ = s.remove_item(STORAGE_ENC);
+        let _ = s.remove_item(STORAGE_SALT);
+    }
+}
+
+fn stored_name() -> String {
+    local_storage()
+        .ok()
+        .and_then(|s| s.get_item(STORAGE_NAME).ok().flatten())
+        .unwrap_or_else(|| "AIM User".to_string())
+}
+
+fn save_name(name: &str) {
+    if let Ok(s) = local_storage() {
+        let _ = s.set_item(STORAGE_NAME, name);
+    }
+}
+
+// ── Web Crypto ────────────────────────────────────────────────────────────────
+
+async fn aes_key(
+    passphrase: &str,
+    salt: &[u8],
+    usage: &str,
+) -> std::result::Result<web_sys::CryptoKey, JsValue> {
+    let window = web_sys::window().ok_or_else(|| JsValue::from_str("no window"))?;
+    let subtle = window.crypto()?.subtle();
+
+    let pass_bytes = Uint8Array::from(TextEncoder::new()?.encode_with_input(passphrase).as_slice());
+    let derive_usages = Array::of1(&JsValue::from_str("deriveKey"));
+    let key_material: web_sys::CryptoKey = JsFuture::from(subtle.import_key_with_str(
+        "raw",
+        pass_bytes.unchecked_ref::<Object>(),
+        "PBKDF2",
+        false,
+        &derive_usages,
+    )?)
+    .await?
+    .dyn_into()?;
+
+    let pbkdf2 = Object::new();
+    Reflect::set(&pbkdf2, &"name".into(), &"PBKDF2".into())?;
+    Reflect::set(&pbkdf2, &"salt".into(), &Uint8Array::from(salt))?;
+    Reflect::set(&pbkdf2, &"iterations".into(), &JsValue::from(100_000u32))?;
+    Reflect::set(&pbkdf2, &"hash".into(), &"SHA-256".into())?;
+
+    let aes_spec = Object::new();
+    Reflect::set(&aes_spec, &"name".into(), &"AES-GCM".into())?;
+    Reflect::set(&aes_spec, &"length".into(), &JsValue::from(256u32))?;
+
+    let key_usages = Array::of1(&JsValue::from_str(usage));
+    JsFuture::from(subtle.derive_key_with_object_and_object(
+        &pbkdf2,
+        &key_material,
+        &aes_spec,
+        false,
+        &key_usages,
+    )?)
+    .await?
+    .dyn_into()
+}
+
+async fn encrypt_key(
+    key_bytes: &[u8; 32],
+    passphrase: &str,
+) -> std::result::Result<(Vec<u8>, Vec<u8>), JsValue> {
+    let crypto = web_sys::window()
+        .ok_or_else(|| JsValue::from_str("no window"))?
+        .crypto()?;
+
+    let salt_arr = Uint8Array::new_with_length(16);
+    crypto.get_random_values_with_array_buffer_view(&salt_arr)?;
+    let salt = salt_arr.to_vec();
+
+    let iv_arr = Uint8Array::new_with_length(12);
+    crypto.get_random_values_with_array_buffer_view(&iv_arr)?;
+    let iv = iv_arr.to_vec();
+
+    let cipher_key = aes_key(passphrase, &salt, "encrypt").await?;
+    let params = Object::new();
+    Reflect::set(&params, &"name".into(), &"AES-GCM".into())?;
+    Reflect::set(&params, &"iv".into(), &Uint8Array::from(iv.as_slice()))?;
+
+    let subtle = web_sys::window()
+        .ok_or_else(|| JsValue::from_str("no window"))?
+        .crypto()?
+        .subtle();
+    let ct = JsFuture::from(subtle.encrypt_with_object_and_buffer_source(
+        &params,
+        &cipher_key,
+        &Uint8Array::from(key_bytes.as_slice()),
+    )?)
+    .await?;
+
+    let mut encrypted = iv;
+    encrypted.extend_from_slice(&Uint8Array::new(&ct).to_vec());
+    Ok((encrypted, salt))
+}
+
+async fn decrypt_key(
+    encrypted: &[u8],
+    salt: &[u8],
+    passphrase: &str,
+) -> std::result::Result<[u8; 32], JsValue> {
+    let iv = &encrypted[..12];
+    let ct = &encrypted[12..];
+
+    let cipher_key = aes_key(passphrase, salt, "decrypt").await?;
+    let params = Object::new();
+    Reflect::set(&params, &"name".into(), &"AES-GCM".into())?;
+    Reflect::set(&params, &"iv".into(), &Uint8Array::from(iv))?;
+
+    let subtle = web_sys::window()
+        .ok_or_else(|| JsValue::from_str("no window"))?
+        .crypto()?
+        .subtle();
+    let pt = JsFuture::from(subtle.decrypt_with_object_and_buffer_source(
+        &params,
+        &cipher_key,
+        &Uint8Array::from(ct),
+    )?)
+    .await?;
+
+    Uint8Array::new(&pt)
+        .to_vec()
+        .try_into()
+        .map_err(|_| JsValue::from_str("decrypted key has wrong length"))
+}
+
+// ── Gossip protocol ───────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
@@ -56,37 +227,18 @@ enum ChatGossipCommand {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
 enum ChatGossipEvent {
-    Joined {
-        topic: String,
-    },
-    NeighborUp {
-        endpoint: String,
-    },
-    NeighborDown {
-        endpoint: String,
-    },
-    Chat {
-        from_endpoint: String,
-        from_name: String,
-        text: String,
-    },
-    System {
-        text: String,
-    },
+    Joined { topic: String },
+    NeighborUp { endpoint: String },
+    NeighborDown { endpoint: String },
+    Chat { from_endpoint: String, from_name: String, text: String },
+    System { text: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
 enum ChatWireMessage {
-    AboutMe {
-        endpoint: String,
-        name: String,
-    },
-    Chat {
-        from_endpoint: String,
-        from_name: String,
-        text: String,
-    },
+    AboutMe { endpoint: String, name: String },
+    Chat { from_endpoint: String, from_name: String, text: String },
 }
 
 #[derive(Debug, Clone)]
@@ -111,7 +263,6 @@ impl Default for ChatGossipProtocol {
 
 impl BrowserProtocol for ChatGossipProtocol {
     const ALPN: &'static [u8] = GOSSIP_ALPN;
-
     type Command = ChatGossipCommand;
     type Event = ChatGossipEvent;
     type Handler = Gossip;
@@ -122,12 +273,7 @@ impl BrowserProtocol for ChatGossipProtocol {
 
     async fn handle_command(&self, command: Self::Command) -> Result<()> {
         match command {
-            ChatGossipCommand::Join {
-                topic,
-                peers,
-                endpoint,
-                name,
-            } => {
+            ChatGossipCommand::Join { topic, peers, endpoint, name } => {
                 let topic_id = parse_topic(&topic)?;
                 let peers = parse_peers(&peers)?;
                 let gossip = self.existing_gossip()?;
@@ -138,7 +284,7 @@ impl BrowserProtocol for ChatGossipProtocol {
                 let (sender, mut receiver) = topic_handle.split();
                 self.topics
                     .lock()
-                    .expect("chat gossip topic mutex poisoned")
+                    .expect("topics mutex poisoned")
                     .insert(topic.clone(), sender.clone());
                 let events = self.events_tx.clone();
                 let topic_for_task = topic.clone();
@@ -148,11 +294,11 @@ impl BrowserProtocol for ChatGossipProtocol {
                 task::spawn(async move {
                     while let Some(event) = receiver.next().await {
                         match event {
-                            Ok(GossipEvent::NeighborUp(endpoint)) => {
+                            Ok(GossipEvent::NeighborUp(ep)) => {
                                 let _ = events.send(ChatGossipEvent::NeighborUp {
-                                    endpoint: endpoint.to_string(),
+                                    endpoint: ep.to_string(),
                                 });
-                                if let Err(error) = broadcast_wire(
+                                if let Err(e) = broadcast_wire(
                                     &sender_for_task,
                                     ChatWireMessage::AboutMe {
                                         endpoint: endpoint_for_task.clone(),
@@ -162,30 +308,26 @@ impl BrowserProtocol for ChatGossipProtocol {
                                 .await
                                 {
                                     let _ = events.send(ChatGossipEvent::System {
-                                        text: format!("failed to announce peer: {error}"),
+                                        text: format!("failed to announce: {e}"),
                                     });
                                 }
                             }
-                            Ok(GossipEvent::NeighborDown(endpoint)) => {
+                            Ok(GossipEvent::NeighborDown(ep)) => {
                                 let _ = events.send(ChatGossipEvent::NeighborDown {
-                                    endpoint: endpoint.to_string(),
+                                    endpoint: ep.to_string(),
                                 });
                             }
-                            Ok(GossipEvent::Received(message)) => {
-                                if let Ok(message) =
-                                    serde_json::from_slice::<ChatWireMessage>(&message.content)
+                            Ok(GossipEvent::Received(msg)) => {
+                                if let Ok(wire) =
+                                    serde_json::from_slice::<ChatWireMessage>(&msg.content)
                                 {
-                                    match message {
+                                    match wire {
                                         ChatWireMessage::AboutMe { endpoint, name } => {
                                             let _ = events.send(ChatGossipEvent::System {
                                                 text: format!("{name} joined ({endpoint})"),
                                             });
                                         }
-                                        ChatWireMessage::Chat {
-                                            from_endpoint,
-                                            from_name,
-                                            text,
-                                        } => {
+                                        ChatWireMessage::Chat { from_endpoint, from_name, text } => {
                                             let _ = events.send(ChatGossipEvent::Chat {
                                                 from_endpoint,
                                                 from_name,
@@ -200,9 +342,9 @@ impl BrowserProtocol for ChatGossipProtocol {
                                     text: "missed gossip messages".into(),
                                 });
                             }
-                            Err(error) => {
+                            Err(e) => {
                                 let _ = events.send(ChatGossipEvent::System {
-                                    text: format!("gossip receive error: {error}"),
+                                    text: format!("gossip error: {e}"),
                                 });
                                 break;
                             }
@@ -212,33 +354,19 @@ impl BrowserProtocol for ChatGossipProtocol {
                         text: format!("left topic {topic_for_task}"),
                     });
                 });
-                let _ = self.events_tx.send(ChatGossipEvent::Joined {
-                    topic: topic.clone(),
-                });
+                let _ = self.events_tx.send(ChatGossipEvent::Joined { topic: topic.clone() });
                 broadcast_wire(&sender, ChatWireMessage::AboutMe { endpoint, name }).await?;
             }
-            ChatGossipCommand::Send {
-                topic,
-                from_endpoint,
-                from_name,
-                text,
-            } => {
+            ChatGossipCommand::Send { topic, from_endpoint, from_name, text } => {
                 let sender = self
                     .topics
                     .lock()
-                    .expect("chat gossip topic mutex poisoned")
+                    .expect("topics mutex poisoned")
                     .get(&topic)
                     .cloned()
-                    .ok_or_else(|| Error::WebRtc(format!("not joined to gossip topic {topic}")))?;
-                broadcast_wire(
-                    &sender,
-                    ChatWireMessage::Chat {
-                        from_endpoint,
-                        from_name,
-                        text,
-                    },
-                )
-                .await?;
+                    .ok_or_else(|| Error::WebRtc(format!("not joined to {topic}")))?;
+                broadcast_wire(&sender, ChatWireMessage::Chat { from_endpoint, from_name, text })
+                    .await?;
             }
         }
         Ok(())
@@ -251,31 +379,28 @@ impl BrowserProtocol for ChatGossipProtocol {
 
 impl ChatGossipProtocol {
     fn gossip(&self, endpoint: Endpoint) -> Gossip {
-        let mut gossip = self.gossip.lock().expect("chat gossip mutex poisoned");
-        if let Some(gossip) = gossip.as_ref() {
-            return gossip.clone();
+        let mut g = self.gossip.lock().expect("gossip mutex poisoned");
+        if let Some(g) = g.as_ref() {
+            return g.clone();
         }
         let spawned = Gossip::builder().spawn(endpoint);
-        *gossip = Some(spawned.clone());
+        *g = Some(spawned.clone());
         spawned
     }
 
     fn existing_gossip(&self) -> Result<Gossip> {
         self.gossip
             .lock()
-            .expect("chat gossip mutex poisoned")
+            .expect("gossip mutex poisoned")
             .clone()
-            .ok_or_else(|| Error::WebRtc("gossip handler has not been registered".into()))
+            .ok_or_else(|| Error::WebRtc("gossip not yet registered".into()))
     }
 }
 
-async fn broadcast_wire(sender: &GossipSender, message: ChatWireMessage) -> Result<()> {
-    let encoded = serde_json::to_vec(&message)
-        .map_err(|error| Error::WebRtc(format!("failed to encode chat message: {error}")))?;
-    sender
-        .broadcast(Bytes::from(encoded))
-        .await
-        .map_err(error_from_display)
+async fn broadcast_wire(sender: &GossipSender, msg: ChatWireMessage) -> Result<()> {
+    let encoded = serde_json::to_vec(&msg)
+        .map_err(|e| Error::WebRtc(format!("encode error: {e}")))?;
+    sender.broadcast(Bytes::from(encoded)).await.map_err(error_from_display)
 }
 
 fn parse_topic(topic: &str) -> Result<TopicId> {
@@ -285,12 +410,30 @@ fn parse_topic(topic: &str) -> Result<TopicId> {
 fn parse_peers(peers: &[String]) -> Result<Vec<EndpointId>> {
     peers
         .iter()
-        .map(|peer| EndpointId::from_str(peer).map_err(error_from_display))
+        .map(|p| EndpointId::from_str(p).map_err(error_from_display))
         .collect()
 }
 
-fn error_from_display(error: impl std::fmt::Display) -> Error {
-    Error::WebRtc(error.to_string())
+fn error_from_display(e: impl std::fmt::Display) -> Error {
+    Error::WebRtc(e.to_string())
+}
+
+// ── App state types ───────────────────────────────────────────────────────────
+
+#[derive(Clone, PartialEq, Debug)]
+enum AppPhase {
+    Checking,
+    NeedPassphrase,
+    NewUser,
+    SpawningNode([u8; 32]),
+    Ready,
+    Failed(String),
+}
+
+struct NodeHandle {
+    _node: BrowserWebRtcNode,
+    gossip: BrowserProtocolHandle<ChatGossipProtocol>,
+    endpoint_id: String,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -299,540 +442,783 @@ enum RoomMode {
     Joined,
 }
 
-struct AppState {
-    _node: BrowserWebRtcNode,
-    gossip: BrowserProtocolHandle<ChatGossipProtocol>,
-    topic: String,
-    local_endpoint: String,
+#[derive(Clone, PartialEq, Default)]
+struct ChatState {
     mode: Option<RoomMode>,
+    room_name: String,
+    room_topic: [u8; 32],
     local_name: String,
-    seed_endpoint: Option<String>,
+    messages: Vec<ChatMsg>,
+    participants: Vec<String>,
     topic_joined: bool,
-    messages_sent: usize,
-    messages_received: usize,
-    lagged_events: usize,
-    last_gossip_event: String,
-    remote_names: Vec<String>,
-    document: Document,
-    host_input: HtmlInputElement,
-    name_input: HtmlInputElement,
-    message_input: HtmlTextAreaElement,
-    send_button: HtmlButtonElement,
-    host_button: HtmlButtonElement,
-    join_button: HtmlButtonElement,
-    room_endpoint: Element,
-    participants: Element,
-    gossip_state: Element,
-    messages: HtmlElement,
-    status: Element,
+    status: String,
 }
 
-async fn run_app() -> std::result::Result<(), JsValue> {
-    console_error_panic_hook::set_once();
-    iroh_webrtc_transport::browser::install_browser_console_tracing();
+#[derive(Clone, PartialEq)]
+struct ChatMsg {
+    from_endpoint: String,
+    from_name: String,
+    text: String,
+    is_system: bool,
+}
 
-    let document = document()?;
-    let local = element::<HtmlInputElement>(&document, "local")?;
-    let secret_key = SecretKey::generate();
+// ── App component ─────────────────────────────────────────────────────────────
+
+#[function_component(App)]
+fn app() -> Html {
+    let phase = use_state(|| AppPhase::Checking);
+    let node_ref: Rc<RefCell<Option<NodeHandle>>> = use_mut_ref(|| None);
+    let chat_state = use_state(ChatState::default);
+
+    // Check localStorage on mount
+    {
+        let phase = phase.clone();
+        use_effect_with((), move |_| {
+            if load_stored().is_some() {
+                phase.set(AppPhase::NeedPassphrase);
+            } else {
+                phase.set(AppPhase::NewUser);
+            }
+            || ()
+        });
+    }
+
+    // Spawn node when phase becomes SpawningNode
+    {
+        let phase_val = (*phase).clone();
+        let phase = phase.clone();
+        let node_ref = node_ref.clone();
+        let chat_state = chat_state.clone();
+        use_effect_with(phase_val, move |p| {
+            if let AppPhase::SpawningNode(key_bytes) = p {
+                let key_bytes = *key_bytes;
+                let phase = phase.clone();
+                let node_ref = node_ref.clone();
+                let chat_state = chat_state.clone();
+                spawn_local(async move {
+                    match init_node(key_bytes).await {
+                        Ok(handle) => {
+                            let gossip = handle.gossip.clone();
+                            let ep = handle.endpoint_id.clone();
+                            *node_ref.borrow_mut() = Some(handle);
+                            let state = chat_state.clone();
+                            spawn_local(async move {
+                                gossip_event_loop(gossip, ep, state).await;
+                            });
+                            phase.set(AppPhase::Ready);
+                        }
+                        Err(e) => {
+                            phase.set(AppPhase::Failed(format!("{e:?}")));
+                        }
+                    }
+                });
+            }
+            || ()
+        });
+    }
+
+    match (*phase).clone() {
+        AppPhase::Checking | AppPhase::SpawningNode(_) => html! {
+            <div class="flex h-full items-center justify-center">
+                <div class="aim-window p-6 text-center text-sm font-bold">{"Signing on…"}</div>
+            </div>
+        },
+        AppPhase::NeedPassphrase => {
+            let on_submit = {
+                let phase = phase.clone();
+                Callback::from(move |pass: String| {
+                    let phase = phase.clone();
+                    spawn_local(async move {
+                        match load_stored() {
+                            Some((enc, salt)) => match decrypt_key(&enc, &salt, &pass).await {
+                                Ok(kb) => phase.set(AppPhase::SpawningNode(kb)),
+                                Err(_) => phase.set(AppPhase::Failed("Wrong passphrase.".into())),
+                            },
+                            None => phase.set(AppPhase::NewUser),
+                        }
+                    });
+                })
+            };
+            let on_forget = {
+                let phase = phase.clone();
+                Callback::from(move |_: ()| {
+                    forget_stored();
+                    phase.set(AppPhase::NewUser);
+                })
+            };
+            html! { <PassphraseGate {on_submit} {on_forget} /> }
+        }
+        AppPhase::NewUser => {
+            let on_ready = {
+                let phase = phase.clone();
+                Callback::from(move |(kb, pass): ([u8; 32], Option<String>)| {
+                    let phase = phase.clone();
+                    spawn_local(async move {
+                        if let Some(p) = pass {
+                            if !p.is_empty() {
+                                if let Ok((enc, salt)) = encrypt_key(&kb, &p).await {
+                                    let _ = persist(&enc, &salt);
+                                }
+                            }
+                        }
+                        phase.set(AppPhase::SpawningNode(kb));
+                    });
+                })
+            };
+            html! { <NewUserSetup {on_ready} /> }
+        }
+        AppPhase::Ready => {
+            let handle_data = node_ref
+                .borrow()
+                .as_ref()
+                .map(|h| (h.endpoint_id.clone(), h.gossip.clone()));
+            if let Some((endpoint_id, gossip)) = handle_data {
+                let state = (*chat_state).clone();
+                let on_host = {
+                    let gossip = gossip.clone();
+                    let chat_state = chat_state.clone();
+                    let ep = endpoint_id.clone();
+                    Callback::from(move |(topic_b64, room_name, name): (String, String, String)| {
+                        let (g, cs, ep) = (gossip.clone(), chat_state.clone(), ep.clone());
+                        spawn_local(async move { do_host(g, ep, topic_b64, room_name, name, cs).await; });
+                    })
+                };
+                let on_join = {
+                    let gossip = gossip.clone();
+                    let chat_state = chat_state.clone();
+                    let ep = endpoint_id.clone();
+                    Callback::from(move |(invite, room_name, name): (String, String, String)| {
+                        let (g, cs, ep) = (gossip.clone(), chat_state.clone(), ep.clone());
+                        spawn_local(async move { do_join(g, ep, invite, room_name, name, cs).await; });
+                    })
+                };
+                let on_send = {
+                    let gossip = gossip.clone();
+                    let chat_state = chat_state.clone();
+                    let ep = endpoint_id.clone();
+                    Callback::from(move |(text, name): (String, String)| {
+                        let (g, cs, ep) = (gossip.clone(), chat_state.clone(), ep.clone());
+                        spawn_local(async move { do_send(g, ep, name, text, cs).await; });
+                    })
+                };
+                html! {
+                    <ChatRoom {endpoint_id} {state} {on_host} {on_join} {on_send} />
+                }
+            } else {
+                html! { <div class="p-4 text-red-600">{"Error: node handle missing"}</div> }
+            }
+        }
+        AppPhase::Failed(msg) => html! {
+            <div class="flex h-full items-center justify-center">
+                <div class="aim-window w-80">
+                    <div class="aim-titlebar">{"Error"}</div>
+                    <div class="p-4 text-sm text-red-700">{msg}</div>
+                </div>
+            </div>
+        },
+    }
+}
+
+// ── PassphraseGate ────────────────────────────────────────────────────────────
+
+#[derive(Properties, PartialEq)]
+struct PassphraseGateProps {
+    on_submit: Callback<String>,
+    on_forget: Callback<()>,
+}
+
+#[function_component(PassphraseGate)]
+fn passphrase_gate(props: &PassphraseGateProps) -> Html {
+    let pass = use_state(String::new);
+
+    let on_input = {
+        let pass = pass.clone();
+        Callback::from(move |e: InputEvent| {
+            let el: HtmlInputElement = e.target_unchecked_into();
+            pass.set(el.value());
+        })
+    };
+    let on_sign_on = {
+        let pass = pass.clone();
+        let cb = props.on_submit.clone();
+        Callback::from(move |_: MouseEvent| cb.emit((*pass).clone()))
+    };
+    let on_forget = {
+        let cb = props.on_forget.clone();
+        Callback::from(move |_: MouseEvent| cb.emit(()))
+    };
+    let on_keydown = {
+        let pass = pass.clone();
+        let cb = props.on_submit.clone();
+        Callback::from(move |e: KeyboardEvent| {
+            if e.key() == "Enter" {
+                cb.emit((*pass).clone());
+            }
+        })
+    };
+
+    html! {
+        <div class="flex h-full items-center justify-center">
+            <div class="aim-window w-80">
+                <div class="aim-titlebar">{"🔵 Iroh Messenger"}</div>
+                <div class="p-4">
+                    <p class="text-sm font-bold mb-1">{"Welcome back!"}</p>
+                    <p class="text-xs text-gray-600 mb-4">{"Enter your passphrase to sign on."}</p>
+                    <div class="mb-1 text-xs font-bold">{"Passphrase:"}</div>
+                    <input
+                        type="password"
+                        class="aim-input mb-3"
+                        oninput={on_input}
+                        onkeydown={on_keydown}
+                        autofocus=true
+                    />
+                    <button class="aim-btn w-full" onclick={on_sign_on}>{"Sign On"}</button>
+                    <button
+                        class="mt-3 block text-xs text-blue-700 underline cursor-pointer bg-transparent border-0 p-0"
+                        onclick={on_forget}
+                    >
+                        {"Not you? Start fresh"}
+                    </button>
+                </div>
+            </div>
+        </div>
+    }
+}
+
+// ── NewUserSetup ──────────────────────────────────────────────────────────────
+
+#[derive(Properties, PartialEq)]
+struct NewUserSetupProps {
+    on_ready: Callback<([u8; 32], Option<String>)>,
+}
+
+#[function_component(NewUserSetup)]
+fn new_user_setup(props: &NewUserSetupProps) -> Html {
+    let name = use_state(stored_name);
+    let pass = use_state(String::new);
+
+    let on_name = {
+        let name = name.clone();
+        Callback::from(move |e: InputEvent| {
+            let el: HtmlInputElement = e.target_unchecked_into();
+            name.set(el.value());
+        })
+    };
+    let on_pass = {
+        let pass = pass.clone();
+        Callback::from(move |e: InputEvent| {
+            let el: HtmlInputElement = e.target_unchecked_into();
+            pass.set(el.value());
+        })
+    };
+    let on_go = {
+        let name = name.clone();
+        let pass = pass.clone();
+        let cb = props.on_ready.clone();
+        Callback::from(move |_: MouseEvent| {
+            let n = (*name).clone();
+            save_name(&n);
+            let key_bytes = SecretKey::generate().to_bytes();
+            let p = if (*pass).is_empty() { None } else { Some((*pass).clone()) };
+            cb.emit((key_bytes, p));
+        })
+    };
+    let on_keydown = {
+        let name = name.clone();
+        let pass = pass.clone();
+        let cb = props.on_ready.clone();
+        Callback::from(move |e: KeyboardEvent| {
+            if e.key() == "Enter" {
+                let n = (*name).clone();
+                save_name(&n);
+                let key_bytes = SecretKey::generate().to_bytes();
+                let p = if (*pass).is_empty() { None } else { Some((*pass).clone()) };
+                cb.emit((key_bytes, p));
+            }
+        })
+    };
+
+    html! {
+        <div class="flex h-full items-center justify-center">
+            <div class="aim-window w-80">
+                <div class="aim-titlebar">{"🔵 Iroh Messenger — New Account"}</div>
+                <div class="p-4">
+                    <p class="text-xs text-gray-600 mb-4">
+                        {"Choose a screen name. Add a passphrase to remember your identity between sessions (optional)."}
+                    </p>
+                    <div class="mb-1 text-xs font-bold">{"Screen Name:"}</div>
+                    <input
+                        type="text"
+                        class="aim-input mb-3"
+                        value={(*name).clone()}
+                        oninput={on_name}
+                        onkeydown={on_keydown.clone()}
+                        maxlength="32"
+                        autofocus=true
+                    />
+                    <div class="mb-1 text-xs font-bold">
+                        {"Passphrase: "}
+                        <span class="font-normal text-gray-500">{"(leave blank for none)"}</span>
+                    </div>
+                    <input
+                        type="password"
+                        class="aim-input mb-4"
+                        oninput={on_pass}
+                        onkeydown={on_keydown}
+                    />
+                    <button class="aim-btn w-full" onclick={on_go}>{"Create & Sign On"}</button>
+                </div>
+            </div>
+        </div>
+    }
+}
+
+// ── ChatRoom ──────────────────────────────────────────────────────────────────
+
+#[derive(Properties, PartialEq)]
+struct ChatRoomProps {
+    endpoint_id: String,
+    state: ChatState,
+    on_host: Callback<(String, String, String)>,  // (topic_b64, room_name, screen_name)
+    on_join: Callback<(String, String, String)>,  // (invite "topic_b64|endpoint", room_name, screen_name)
+    on_send: Callback<(String, String)>,
+}
+
+#[function_component(ChatRoom)]
+fn chat_room(props: &ChatRoomProps) -> Html {
+    let name = use_state(stored_name);
+    let host_input = use_state(|| {
+        web_sys::window()
+            .and_then(|w| w.location().hash().ok())
+            .map(|h| h.trim_start_matches('#').to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_default()
+    });
+    let room_name_input = use_state(|| String::from("general"));
+    let msg_input = use_state(String::new);
+    let messages_ref = use_node_ref();
+
+    // Auto-scroll on new messages
+    use_effect_with(props.state.messages.len(), {
+        let r = messages_ref.clone();
+        move |_| {
+            if let Some(el) = r.cast::<HtmlElement>() {
+                el.set_scroll_top(el.scroll_height());
+            }
+            || ()
+        }
+    });
+
+    let share_url = {
+        let topic_b64 = BASE64.encode(props.state.room_topic);
+        web_sys::window()
+            .and_then(|w| {
+                let loc = w.location();
+                let origin = loc.origin().ok()?;
+                let path = loc.pathname().ok()?;
+                Some(format!("{}{}#{}|{}", origin, path, topic_b64, props.endpoint_id))
+            })
+            .unwrap_or_default()
+    };
+
+    let in_room = props.state.mode.is_some();
+    let can_send = props.state.topic_joined;
+
+    let on_name_input = {
+        let name = name.clone();
+        Callback::from(move |e: InputEvent| {
+            let el: HtmlInputElement = e.target_unchecked_into();
+            let v = el.value();
+            save_name(&v);
+            name.set(v);
+        })
+    };
+    let on_host_input = {
+        let host_input = host_input.clone();
+        Callback::from(move |e: InputEvent| {
+            let el: HtmlInputElement = e.target_unchecked_into();
+            host_input.set(el.value());
+        })
+    };
+    let on_room_name_input = {
+        let room_name_input = room_name_input.clone();
+        Callback::from(move |e: InputEvent| {
+            let el: HtmlInputElement = e.target_unchecked_into();
+            room_name_input.set(el.value());
+        })
+    };
+    let on_msg_input = {
+        let msg_input = msg_input.clone();
+        Callback::from(move |e: InputEvent| {
+            let el: HtmlTextAreaElement = e.target_unchecked_into();
+            msg_input.set(el.value());
+        })
+    };
+
+    let on_host_click = {
+        let name = name.clone();
+        let room_name_input = room_name_input.clone();
+        let cb = props.on_host.clone();
+        Callback::from(move |_: MouseEvent| {
+            let mut topic_bytes = [0u8; 32];
+            if let Ok(crypto) = web_sys::window().unwrap().crypto() {
+                let arr = Uint8Array::new_with_length(32);
+                let _ = crypto.get_random_values_with_array_buffer_view(&arr);
+                arr.copy_to(&mut topic_bytes);
+            }
+            let topic_b64 = BASE64.encode(topic_bytes);
+            cb.emit((topic_b64, (*room_name_input).clone(), (*name).clone()));
+        })
+    };
+    let on_join_click = {
+        let name = name.clone();
+        let host_input = host_input.clone();
+        let room_name_input = room_name_input.clone();
+        let cb = props.on_join.clone();
+        Callback::from(move |_: MouseEvent| {
+            let h = (*host_input).trim().to_string();
+            if !h.is_empty() {
+                cb.emit((h, (*room_name_input).clone(), (*name).clone()));
+            }
+        })
+    };
+
+    let send = {
+        let name = name.clone();
+        let msg_input = msg_input.clone();
+        let cb = props.on_send.clone();
+        move || {
+            let text = (*msg_input).trim().to_string();
+            if !text.is_empty() {
+                msg_input.set(String::new());
+                cb.emit((text, (*name).clone()));
+            }
+        }
+    };
+    let on_send_click = {
+        let send = send.clone();
+        Callback::from(move |_: MouseEvent| send())
+    };
+    let on_send_keydown = {
+        Callback::from(move |e: KeyboardEvent| {
+            if e.key() == "Enter" && !e.shift_key() {
+                e.prevent_default();
+                send();
+            }
+        })
+    };
+
+    let on_share_click = Callback::from(|e: MouseEvent| {
+        if let Some(el) = e.target().and_then(|t| t.dyn_into::<web_sys::HtmlInputElement>().ok()) {
+            el.select();
+        }
+    });
+
+    html! {
+        <div class="aim-window flex flex-col h-full">
+            <div class="aim-titlebar">
+                {"🔵 Iroh Messenger"}
+                <span class="ml-auto font-normal opacity-75 text-[10px]">{"#general · WebRTC P2P"}</span>
+            </div>
+            <div class="flex flex-1 min-h-0">
+                // ── Left sidebar ──────────────────────────────────────────────
+                <div class="w-52 shrink-0 border-r-2 border-r-[#808080] flex flex-col overflow-hidden">
+
+                    <div class="p-2 border-b border-[#808080]">
+                        <div class="aim-section-label">{"Screen Name"}</div>
+                        <input
+                            type="text"
+                            class="aim-input"
+                            value={(*name).clone()}
+                            oninput={on_name_input}
+                            maxlength="32"
+                        />
+                    </div>
+
+                    <div class="p-2 border-b border-[#808080]">
+                        <div class="aim-section-label">{"Your Endpoint"}</div>
+                        <div class="aim-inset p-1 text-[10px] font-mono endpoint max-h-10 overflow-auto">
+                            {props.endpoint_id.clone()}
+                        </div>
+                        if props.state.mode == Some(RoomMode::Hosting) {
+                            <div class="mt-2">
+                                <div class="aim-section-label">{"Invite Link"}</div>
+                                <input
+                                    type="text"
+                                    class="aim-input text-[10px] font-mono"
+                                    readonly=true
+                                    value={share_url}
+                                    onclick={on_share_click}
+                                />
+                            </div>
+                        }
+                    </div>
+
+                    <div class="p-2 border-b border-[#808080]">
+                        <div class="aim-section-label">{"Room"}</div>
+                        <input
+                            type="text"
+                            class="aim-input mb-1"
+                            placeholder="room name"
+                            value={if in_room { props.state.room_name.clone() } else { (*room_name_input).clone() }}
+                            oninput={on_room_name_input}
+                            disabled={in_room}
+                        />
+                        <input
+                            type="text"
+                            class="aim-input text-[10px] font-mono mb-1"
+                            placeholder="paste invite link to join"
+                            value={(*host_input).clone()}
+                            oninput={on_host_input}
+                            disabled={in_room}
+                            spellcheck="false"
+                        />
+                        <div class="flex gap-1">
+                            <button
+                                class="aim-btn flex-1 px-1"
+                                onclick={on_host_click}
+                                disabled={in_room}
+                            >{"Host"}</button>
+                            <button
+                                class="aim-btn flex-1 px-1"
+                                onclick={on_join_click}
+                                disabled={in_room}
+                            >{"Join"}</button>
+                        </div>
+                    </div>
+
+                    <div class="flex-1 overflow-auto p-2">
+                        <div class="aim-section-label">{"Buddies Online"}</div>
+                        <ul>
+                            if in_room {
+                                <li class="aim-buddy font-bold text-[#000080]">
+                                    {(*name).clone()}{" (me)"}
+                                </li>
+                            }
+                            { for props.state.participants.iter().map(|ep| {
+                                let short = ep.chars().take(20).collect::<String>();
+                                html! { <li class="aim-buddy">{short}</li> }
+                            })}
+                        </ul>
+                    </div>
+
+                    <div class="p-1 border-t border-[#808080] text-[10px] text-gray-600 min-h-5 leading-tight">
+                        {props.state.status.clone()}
+                    </div>
+                </div>
+
+                // ── Chat area ─────────────────────────────────────────────────
+                <div class="flex flex-1 flex-col min-h-0">
+                    <div
+                        ref={messages_ref}
+                        class="aim-inset flex-1 overflow-auto p-2 aim-chat-log"
+                    >
+                        { for props.state.messages.iter().map(|msg| {
+                            if msg.is_system {
+                                html! { <p class="aim-system-msg">{msg.text.clone()}</p> }
+                            } else {
+                                let is_me = msg.from_endpoint == props.endpoint_id;
+                                let sender_class = if is_me { "sender-me" } else { "sender-them" };
+                                html! {
+                                    <p>
+                                        <span class={sender_class}>
+                                            {msg.from_name.clone()}{": "}
+                                        </span>
+                                        {msg.text.clone()}
+                                    </p>
+                                }
+                            }
+                        })}
+                    </div>
+
+                    <div class="border-t-2 border-t-[#808080] p-2 flex gap-2 items-end bg-[#c0c0c0]">
+                        <textarea
+                            class="aim-inset flex-1 p-1 text-sm h-16 resize-none font-[Arial,sans-serif]"
+                            placeholder="Type a message… (Enter to send, Shift+Enter for newline)"
+                            value={(*msg_input).clone()}
+                            oninput={on_msg_input}
+                            onkeydown={on_send_keydown}
+                            disabled={!can_send}
+                        />
+                        <button
+                            class="aim-btn self-end"
+                            onclick={on_send_click}
+                            disabled={!can_send}
+                        >{"Send"}</button>
+                    </div>
+                </div>
+            </div>
+        </div>
+    }
+}
+
+// ── Async handlers ────────────────────────────────────────────────────────────
+
+async fn init_node(key_bytes: [u8; 32]) -> std::result::Result<NodeHandle, JsValue> {
+    let secret_key = SecretKey::from_bytes(&key_bytes);
     let node = BrowserWebRtcNode::builder(
         BrowserWebRtcNodeConfig::default()
             .with_protocol_transport_preference(BrowserDialTransportPreference::WebRtcOnly),
         secret_key,
     )
     .protocol(ChatGossipProtocol::default())
-    .map_err(|err| JsValue::from_str(&err))?
+    .map_err(|e| JsValue::from_str(&e.to_string()))?
     .spawn()
     .await?;
+
     let gossip = node.protocol::<ChatGossipProtocol>().await?;
-    let local_endpoint = node.endpoint_id().to_owned();
-    let topic = TopicId::from_bytes(CHAT_TOPIC_BYTES).to_string();
-    local.set_value(&local_endpoint);
-
-    let state = Rc::new(RefCell::new(AppState {
-        _node: node,
-        gossip,
-        topic,
-        local_endpoint: local_endpoint.clone(),
-        mode: None,
-        local_name: "Browser peer".to_owned(),
-        seed_endpoint: None,
-        topic_joined: false,
-        messages_sent: 0,
-        messages_received: 0,
-        lagged_events: 0,
-        last_gossip_event: "idle".to_owned(),
-        remote_names: Vec::new(),
-        document: document.clone(),
-        host_input: element(&document, "host")?,
-        name_input: element(&document, "name")?,
-        message_input: element(&document, "message")?,
-        send_button: element(&document, "send")?,
-        host_button: element(&document, "host-room")?,
-        join_button: element(&document, "join-room")?,
-        room_endpoint: element(&document, "room-endpoint")?,
-        participants: element(&document, "participants")?,
-        gossip_state: element(&document, "gossip-state")?,
-        messages: element(&document, "messages")?,
-        status: element(&document, "status")?,
-    }));
-
-    set_status(&state, &format!("local endpoint: {local_endpoint}"));
-    render_participants(&state)?;
-    render_gossip_state(&state)?;
-    wire_controls(state)?;
-    Ok(())
+    let endpoint_id = node.endpoint_id().to_owned();
+    Ok(NodeHandle { _node: node, gossip, endpoint_id })
 }
 
-fn wire_controls(state: Rc<RefCell<AppState>>) -> std::result::Result<(), JsValue> {
-    let events_state = state.clone();
-    spawn_local(async move {
-        if let Err(error) = poll_gossip_events(events_state.clone()).await {
-            append_system(
-                &events_state,
-                &format!("event error: {}", js_error_text(error)),
-            );
-        }
-    });
-
-    let host_state = state.clone();
-    let on_host = Closure::wrap(Box::new(move |_event: web_sys::Event| {
-        let state = host_state.clone();
-        spawn_local(async move {
-            if let Err(error) = host_room(state.clone()).await {
-                append_system(&state, &format!("host error: {}", js_error_text(error)));
-            }
-        });
-    }) as Box<dyn FnMut(_)>);
-    state
-        .borrow()
-        .host_button
-        .add_event_listener_with_callback("click", on_host.as_ref().unchecked_ref())?;
-    on_host.forget();
-
-    let join_state = state.clone();
-    let on_join = Closure::wrap(Box::new(move |_event: web_sys::Event| {
-        let state = join_state.clone();
-        spawn_local(async move {
-            if let Err(error) = join_room(state.clone()).await {
-                append_system(&state, &format!("join error: {}", js_error_text(error)));
-            }
-        });
-    }) as Box<dyn FnMut(_)>);
-    state
-        .borrow()
-        .join_button
-        .add_event_listener_with_callback("click", on_join.as_ref().unchecked_ref())?;
-    on_join.forget();
-
-    let send_state = state.clone();
-    let on_send = Closure::wrap(Box::new(move |_event: web_sys::Event| {
-        let state = send_state.clone();
-        spawn_local(async move {
-            if let Err(error) = send_current_message(state.clone()).await {
-                append_system(&state, &format!("send error: {}", js_error_text(error)));
-            }
-        });
-    }) as Box<dyn FnMut(_)>);
-    state
-        .borrow()
-        .send_button
-        .add_event_listener_with_callback("click", on_send.as_ref().unchecked_ref())?;
-    on_send.forget();
-
-    let enter_state = state.clone();
-    let on_keydown = Closure::wrap(Box::new(move |event: KeyboardEvent| {
-        if event.key() != "Enter" || event.shift_key() {
-            return;
-        }
-        event.prevent_default();
-        let state = enter_state.clone();
-        spawn_local(async move {
-            if let Err(error) = send_current_message(state.clone()).await {
-                append_system(&state, &format!("send error: {}", js_error_text(error)));
-            }
-        });
-    }) as Box<dyn FnMut(_)>);
-    state
-        .borrow()
-        .message_input
-        .add_event_listener_with_callback("keydown", on_keydown.as_ref().unchecked_ref())?;
-    on_keydown.forget();
-
-    Ok(())
-}
-
-async fn host_room(state: Rc<RefCell<AppState>>) -> std::result::Result<(), JsValue> {
-    let (gossip, topic, endpoint, name) = {
-        let mut state = state.borrow_mut();
-        if state.mode.is_some() {
-            append_system_from_state(&state, "already connected to a room")?;
-            return Ok(());
-        }
-        state.local_name = display_name(&state.name_input);
-        state.mode = Some(RoomMode::Hosting);
-        state.seed_endpoint = None;
-        state.topic_joined = false;
-        state.last_gossip_event = "hosting topic".to_owned();
-        state
-            .room_endpoint
-            .set_text_content(Some(&state.local_endpoint));
-        state.host_button.set_disabled(true);
-        state.join_button.set_disabled(true);
-        set_status_from_state(&state, "hosting; share your local endpoint")?;
-        update_send_controls_from_state(&state)?;
-        (
-            state.gossip.clone(),
-            state.topic.clone(),
-            state.local_endpoint.clone(),
-            state.local_name.clone(),
-        )
-    };
-
-    gossip
-        .send(ChatGossipCommand::Join {
-            topic,
-            peers: Vec::new(),
-            endpoint,
-            name: name.clone(),
-        })
-        .await?;
-    append_system(&state, &format!("{name} is hosting"));
-    render_participants(&state)?;
-    render_gossip_state(&state)?;
-    Ok(())
-}
-
-async fn join_room(state: Rc<RefCell<AppState>>) -> std::result::Result<(), JsValue> {
-    let (gossip, topic, host, endpoint, name) = {
-        let mut state = state.borrow_mut();
-        if state.mode.is_some() {
-            append_system_from_state(&state, "already connected to a room")?;
-            return Ok(());
-        }
-        let host = state.host_input.value().trim().to_owned();
-        if host.is_empty() {
-            append_system_from_state(&state, "enter a host endpoint first")?;
-            return Ok(());
-        }
-        if host == state.local_endpoint {
-            append_system_from_state(&state, "use Host to join your own room locally")?;
-            return Ok(());
-        }
-        state.local_name = display_name(&state.name_input);
-        state.mode = Some(RoomMode::Joined);
-        state.seed_endpoint = Some(host.clone());
-        state.topic_joined = false;
-        state.last_gossip_event = format!("joining through {host}");
-        state.room_endpoint.set_text_content(Some(&host));
-        state.host_button.set_disabled(true);
-        state.join_button.set_disabled(true);
-        set_status_from_state(&state, &format!("joining {host}"))?;
-        update_send_controls_from_state(&state)?;
-        (
-            state.gossip.clone(),
-            state.topic.clone(),
-            host,
-            state.local_endpoint.clone(),
-            state.local_name.clone(),
-        )
-    };
-
-    gossip
-        .send(ChatGossipCommand::Join {
-            topic,
-            peers: vec![host.clone()],
-            endpoint,
-            name: name.clone(),
-        })
-        .await?;
-    append_system(&state, &format!("{name} joined the room"));
-    render_participants(&state)?;
-    render_gossip_state(&state)?;
-    Ok(())
-}
-
-async fn send_current_message(state: Rc<RefCell<AppState>>) -> std::result::Result<(), JsValue> {
-    let (gossip, topic, from_endpoint, from_name, text, connected) = {
-        let state = state.borrow();
-        let text = state.message_input.value().trim().to_owned();
-        if text.is_empty() {
-            return Ok(());
-        }
-        (
-            state.gossip.clone(),
-            state.topic.clone(),
-            state.local_endpoint.clone(),
-            state.local_name.clone(),
-            text,
-            state.mode.is_some(),
-        )
-    };
-    state.borrow().message_input.set_value("");
-    if !connected {
-        append_system(&state, "host or join a room first");
-        return Ok(());
-    }
-
-    append_chat(&state, &from_endpoint, &from_name, &text);
-    gossip
-        .send(ChatGossipCommand::Send {
-            topic,
-            from_endpoint,
-            from_name,
-            text: text.to_string(),
-        })
-        .await?;
-    {
-        let mut state = state.borrow_mut();
-        state.messages_sent += 1;
-        state.last_gossip_event = "broadcast chat message".to_owned();
-    }
-    render_gossip_state(&state)?;
-    Ok(())
-}
-
-async fn poll_gossip_events(state: Rc<RefCell<AppState>>) -> std::result::Result<(), JsValue> {
-    let gossip = state.borrow().gossip.clone();
+async fn gossip_event_loop(
+    gossip: BrowserProtocolHandle<ChatGossipProtocol>,
+    local_ep: String,
+    state: UseStateHandle<ChatState>,
+) {
     loop {
-        let Some(event) = gossip.next_event().await? else {
-            continue;
+        let Ok(Some(event)) = gossip.next_event().await else {
+            break;
         };
+        let mut s = (*state).clone();
         match event {
-            ChatGossipEvent::Joined { topic } => {
-                {
-                    let mut state = state.borrow_mut();
-                    state.topic_joined = true;
-                    state.last_gossip_event = format!("subscribed to topic {topic}");
-                }
-                set_status(&state, "joined gossip topic; waiting for gossip neighbor");
-                update_send_controls(&state)?;
-                render_gossip_state(&state)?;
+            ChatGossipEvent::Joined { .. } => {
+                s.topic_joined = true;
+                s.status = "Joined. Waiting for a neighbor…".into();
             }
             ChatGossipEvent::NeighborUp { endpoint } => {
-                {
-                    let mut state = state.borrow_mut();
-                    if !state.remote_names.iter().any(|peer| peer == &endpoint) {
-                        state.remote_names.push(endpoint.clone());
-                    }
-                    state.last_gossip_event = format!("neighbor up {endpoint}");
+                if !s.participants.contains(&endpoint) {
+                    s.participants.push(endpoint.clone());
                 }
-                append_system(&state, &format!("neighbor connected: {endpoint}"));
-                update_send_controls(&state)?;
-                render_participants(&state)?;
-                render_gossip_state(&state)?;
+                let short = endpoint.chars().take(12).collect::<String>();
+                s.messages.push(sys_msg(&format!("*** {short}… has entered the room")));
+                s.status = format!("{} online", s.participants.len());
             }
             ChatGossipEvent::NeighborDown { endpoint } => {
-                {
-                    let mut state = state.borrow_mut();
-                    state
-                        .remote_names
-                        .retain(|candidate| candidate != &endpoint);
-                    state.last_gossip_event = format!("neighbor down {endpoint}");
-                }
-                append_system(&state, &format!("neighbor disconnected: {endpoint}"));
-                update_send_controls(&state)?;
-                render_participants(&state)?;
-                render_gossip_state(&state)?;
+                s.participants.retain(|p| p != &endpoint);
+                let short = endpoint.chars().take(12).collect::<String>();
+                s.messages.push(sys_msg(&format!("*** {short}… has left the room")));
+                s.status = format!("{} online", s.participants.len());
             }
-            ChatGossipEvent::Chat {
-                from_endpoint,
-                from_name,
-                text,
-            } => {
-                if from_endpoint != state.borrow().local_endpoint {
-                    {
-                        let mut state = state.borrow_mut();
-                        state.messages_received += 1;
-                        state.last_gossip_event = format!("received chat from {from_endpoint}");
-                    }
-                    append_chat(&state, &from_endpoint, &from_name, &text);
-                    render_gossip_state(&state)?;
+            ChatGossipEvent::Chat { from_endpoint, from_name, text } => {
+                if from_endpoint != local_ep {
+                    s.messages.push(ChatMsg { from_endpoint, from_name, text, is_system: false });
                 }
             }
             ChatGossipEvent::System { text } => {
-                {
-                    let mut state = state.borrow_mut();
-                    if text == "missed gossip messages" {
-                        state.lagged_events += 1;
-                    }
-                    state.last_gossip_event = text.clone();
-                }
-                append_system(&state, &text);
-                render_gossip_state(&state)?;
+                s.messages.push(sys_msg(&text));
             }
         }
+        state.set(s);
     }
 }
 
-fn render_participants(state: &Rc<RefCell<AppState>>) -> std::result::Result<(), JsValue> {
-    let state = state.borrow();
-    state.participants.set_text_content(None);
-    if state.mode.is_some() {
-        let item = state.document.create_element("li")?;
-        item.set_class_name("badge badge-primary badge-outline");
-        item.set_text_content(Some(&state.local_name));
-        state.participants.append_child(&item)?;
-    }
-    for peer in &state.remote_names {
-        let item = state.document.create_element("li")?;
-        item.set_class_name("badge badge-neutral badge-outline");
-        item.set_text_content(Some(peer));
-        state.participants.append_child(&item)?;
-    }
-    Ok(())
-}
-
-fn update_send_controls(state: &Rc<RefCell<AppState>>) -> std::result::Result<(), JsValue> {
-    let state = state.borrow();
-    update_send_controls_from_state(&state)
-}
-
-fn update_send_controls_from_state(state: &AppState) -> std::result::Result<(), JsValue> {
-    let can_send = state.topic_joined && !state.remote_names.is_empty();
-    state.message_input.set_disabled(!can_send);
-    state.send_button.set_disabled(!can_send);
-
-    if can_send {
-        set_status_from_state(state, "gossip neighbor connected; messages will broadcast")?;
-    } else if state.mode.is_some() && state.topic_joined {
-        set_status_from_state(state, "waiting for a gossip neighbor before sending")?;
-    }
-
-    Ok(())
-}
-
-fn render_gossip_state(state: &Rc<RefCell<AppState>>) -> std::result::Result<(), JsValue> {
-    let state = state.borrow();
-    state.gossip_state.set_text_content(None);
-
-    let mode = match state.mode {
-        Some(RoomMode::Hosting) => "hosting",
-        Some(RoomMode::Joined) => "joined",
-        None => "idle",
-    };
-    append_state_row(&state, "Mode", mode)?;
-    append_state_row(
-        &state,
-        "ALPN",
-        std::str::from_utf8(GOSSIP_ALPN).unwrap_or("gossip"),
-    )?;
-    append_state_row(&state, "Topic", &state.topic)?;
-    append_state_row(
-        &state,
-        "Seed",
-        state.seed_endpoint.as_deref().unwrap_or("none"),
-    )?;
-    append_state_row(&state, "Neighbors", &state.remote_names.len().to_string())?;
-    append_state_row(&state, "Sent", &state.messages_sent.to_string())?;
-    append_state_row(&state, "Received", &state.messages_received.to_string())?;
-    append_state_row(&state, "Lagged", &state.lagged_events.to_string())?;
-    append_state_row(&state, "Last", &state.last_gossip_event)?;
-    Ok(())
-}
-
-fn append_state_row(
-    state: &AppState,
-    label: &str,
-    value: &str,
-) -> std::result::Result<(), JsValue> {
-    let row = state.document.create_element("div")?;
-    row.set_class_name("grid grid-cols-[5rem_minmax(0,1fr)] gap-2");
-
-    let label_el = state.document.create_element("span")?;
-    label_el.set_class_name("text-xs font-semibold uppercase text-base-content/50");
-    label_el.set_text_content(Some(label));
-
-    let value_el = state.document.create_element("span")?;
-    value_el.set_class_name("endpoint min-w-0 font-mono text-xs text-base-content/85");
-    value_el.set_text_content(Some(value));
-
-    row.append_child(&label_el)?;
-    row.append_child(&value_el)?;
-    state.gossip_state.append_child(&row)?;
-    Ok(())
-}
-
-fn append_chat(state: &Rc<RefCell<AppState>>, from_endpoint: &str, from_name: &str, text: &str) {
-    let state = state.borrow();
-    let Ok(message) = state.document.create_element("div") else {
+async fn do_host(
+    gossip: BrowserProtocolHandle<ChatGossipProtocol>,
+    endpoint: String,
+    topic_b64: String,
+    room_name: String,
+    name: String,
+    state: UseStateHandle<ChatState>,
+) {
+    let mut s = (*state).clone();
+    if s.mode.is_some() {
+        s.messages.push(sys_msg("Already in a room."));
+        state.set(s);
         return;
-    };
-    if from_endpoint == state.local_endpoint {
-        message.set_class_name("chat chat-end");
-    } else {
-        message.set_class_name("chat chat-start");
     }
-    let Ok(name) = state.document.create_element("strong") else {
+    let topic_bytes: [u8; 32] = BASE64.decode(&topic_b64)
+        .ok()
+        .and_then(|b| b.try_into().ok())
+        .unwrap_or([0u8; 32]);
+    s.local_name = name.clone();
+    s.room_name = room_name.clone();
+    s.room_topic = topic_bytes;
+    s.mode = Some(RoomMode::Hosting);
+    s.status = "Hosting. Share the invite link to bring others in.".into();
+    s.messages.push(sys_msg(&format!("*** {name} is hosting #{room_name}. Share the invite link to invite others.")));
+    state.set(s);
+
+    let topic = TopicId::from_bytes(topic_bytes).to_string();
+    let _ = gossip
+        .send(ChatGossipCommand::Join { topic, peers: vec![], endpoint, name })
+        .await;
+}
+
+async fn do_join(
+    gossip: BrowserProtocolHandle<ChatGossipProtocol>,
+    endpoint: String,
+    invite: String,
+    room_name: String,
+    name: String,
+    state: UseStateHandle<ChatState>,
+) {
+    let invite = invite.find('#').map_or(invite.as_str(), |i| &invite[i + 1..]).to_string();
+    let (topic_bytes, host) = if let Some(idx) = invite.find('|') {
+        let topic_b64 = &invite[..idx];
+        let host_ep = invite[idx + 1..].to_string();
+        let bytes = BASE64.decode(topic_b64)
+            .ok()
+            .and_then(|b| b.try_into().ok())
+            .unwrap_or([0u8; 32]);
+        (bytes, host_ep)
+    } else {
+        ([0u8; 32], invite)
+    };
+
+    let mut s = (*state).clone();
+    if s.mode.is_some() {
+        s.messages.push(sys_msg("Already in a room."));
+        state.set(s);
         return;
-    };
-    name.set_class_name("chat-header opacity-70");
-    name.set_text_content(Some(from_name));
-    let Ok(body) = state.document.create_element("div") else {
+    }
+    if host.trim() == endpoint {
+        s.messages.push(sys_msg("That's your own endpoint. Use Host instead."));
+        state.set(s);
         return;
-    };
-    if from_endpoint == state.local_endpoint {
-        body.set_class_name("chat-bubble chat-bubble-primary whitespace-pre-wrap break-words");
-    } else {
-        body.set_class_name("chat-bubble whitespace-pre-wrap break-words");
     }
-    body.set_text_content(Some(text));
-    let _ = message.append_child(&name);
-    let _ = message.append_child(&body);
-    let _ = state.messages.append_child(&message);
-    state
-        .messages
-        .set_scroll_top(state.messages.scroll_height());
+    s.local_name = name.clone();
+    s.room_name = room_name.clone();
+    s.room_topic = topic_bytes;
+    s.mode = Some(RoomMode::Joined);
+    s.status = "Joining…".into();
+    s.messages.push(sys_msg(&format!("*** {name} is joining #{room_name}…")));
+    state.set(s);
+
+    let topic = TopicId::from_bytes(topic_bytes).to_string();
+    let _ = gossip
+        .send(ChatGossipCommand::Join { topic, peers: vec![host], endpoint, name })
+        .await;
 }
 
-fn append_system(state: &Rc<RefCell<AppState>>, text: &str) {
-    let state = state.borrow();
-    let _ = append_system_from_state(&state, text);
-}
-
-fn append_system_from_state(state: &AppState, text: &str) -> std::result::Result<(), JsValue> {
-    let message = state.document.create_element("div")?;
-    message.set_class_name("alert alert-info alert-soft my-2 py-2 text-sm");
-    message.set_text_content(Some(text));
-    state.messages.append_child(&message)?;
-    state
-        .messages
-        .set_scroll_top(state.messages.scroll_height());
-    Ok(())
-}
-
-fn set_status(state: &Rc<RefCell<AppState>>, text: &str) {
-    let state = state.borrow();
-    let _ = set_status_from_state(&state, text);
-}
-
-fn set_status_from_state(state: &AppState, text: &str) -> std::result::Result<(), JsValue> {
-    state.status.set_text_content(Some(text));
-    Ok(())
-}
-
-fn display_name(input: &HtmlInputElement) -> String {
-    let name = input.value().trim().to_owned();
-    if name.is_empty() {
-        "Browser peer".to_owned()
-    } else {
-        name
+async fn do_send(
+    gossip: BrowserProtocolHandle<ChatGossipProtocol>,
+    endpoint: String,
+    name: String,
+    text: String,
+    state: UseStateHandle<ChatState>,
+) {
+    let mut s = (*state).clone();
+    if s.mode.is_none() {
+        s.messages.push(sys_msg("Host or join a room first."));
+        state.set(s);
+        return;
     }
+    let room_topic = s.room_topic;
+    s.messages.push(ChatMsg {
+        from_endpoint: endpoint.clone(),
+        from_name: name.clone(),
+        text: text.clone(),
+        is_system: false,
+    });
+    state.set(s);
+
+    let topic = TopicId::from_bytes(room_topic).to_string();
+    let _ = gossip
+        .send(ChatGossipCommand::Send { topic, from_endpoint: endpoint, from_name: name, text })
+        .await;
 }
 
-fn document() -> std::result::Result<Document, JsValue> {
-    web_sys::window()
-        .and_then(|window| window.document())
-        .ok_or_else(|| JsValue::from_str("browser document is unavailable"))
-}
-
-fn element<T: JsCast>(document: &Document, id: &str) -> std::result::Result<T, JsValue> {
-    document
-        .get_element_by_id(id)
-        .ok_or_else(|| JsValue::from_str(&format!("missing #{id}")))?
-        .dyn_into::<T>()
-        .map_err(|_| JsValue::from_str(&format!("#{id} has the wrong element type")))
-}
-
-fn js_error_text(error: JsValue) -> String {
-    error.as_string().unwrap_or_else(|| format!("{error:?}"))
+fn sys_msg(text: &str) -> ChatMsg {
+    ChatMsg { from_endpoint: String::new(), from_name: String::new(), text: text.into(), is_system: true }
 }

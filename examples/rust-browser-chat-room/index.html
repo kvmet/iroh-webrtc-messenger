@@ -1,137 +1,105 @@
 <!doctype html>
 <html lang="en">
   <head>
-    <link href="https://cdn.jsdelivr.net/npm/daisyui@5" rel="stylesheet" type="text/css" />
-    <script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script>
-    <link href="https://cdn.jsdelivr.net/npm/daisyui@5/themes.css" rel="stylesheet" type="text/css" />
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>Iroh WebRTC Rust Browser Chat Room</title>
+    <title>Iroh Messenger</title>
+    <script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script>
     <script>
       globalThis.addEventListener("TrunkApplicationStarted", () => {
-        globalThis.wasmBindings.start_app().catch((error) => {
-          console.error("failed to start Iroh WebRTC chat room app", error);
-        });
+        globalThis.wasmBindings.start_app();
       });
     </script>
     <style>
-      .endpoint {
-        overflow-wrap: anywhere;
+      html, body { height: 100%; margin: 0; overflow: hidden; }
+
+      .aim-window {
+        border: 2px solid;
+        border-color: #ffffff #808080 #808080 #ffffff;
+        box-shadow: 1px 1px 0 #000;
+        background: #c0c0c0;
+      }
+
+      .aim-titlebar {
+        background: linear-gradient(90deg, #000080 0%, #1084d0 100%);
+        color: #fff;
+        font-size: 0.75rem;
+        font-weight: bold;
+        padding: 3px 8px;
+        user-select: none;
+        display: flex;
+        align-items: center;
+        gap: 6px;
+      }
+
+      .aim-btn {
+        background: #c0c0c0;
+        border: 2px solid;
+        border-color: #ffffff #808080 #808080 #ffffff;
+        padding: 2px 14px;
+        font-size: 0.8125rem;
+        cursor: pointer;
+        min-width: 56px;
+        font-family: inherit;
+      }
+      .aim-btn:hover:not(:disabled) { background: #d4d0c8; }
+      .aim-btn:active:not(:disabled) {
+        border-color: #808080 #ffffff #ffffff #808080;
+      }
+      .aim-btn:disabled { color: #808080; cursor: not-allowed; }
+
+      .aim-input {
+        border: 2px solid;
+        border-color: #808080 #ffffff #ffffff #808080;
+        background: white;
+        padding: 2px 4px;
+        font-size: 0.8125rem;
+        font-family: inherit;
+        outline: none;
+        width: 100%;
+        box-sizing: border-box;
+      }
+      .aim-input:focus { outline: 1px dotted #000; outline-offset: -3px; }
+
+      .aim-inset {
+        border: 2px solid;
+        border-color: #808080 #ffffff #ffffff #808080;
+        background: white;
+      }
+
+      .aim-buddy { padding: 1px 8px; font-size: 0.8125rem; cursor: default; }
+      .aim-buddy:hover { background: #000080; color: white; }
+
+      .aim-system-msg {
+        color: #666;
+        font-style: italic;
+        font-size: 0.8125rem;
+        padding: 1px 0;
+      }
+
+      .sender-me { font-weight: bold; color: #000080; }
+      .sender-them { font-weight: bold; color: #8b0000; }
+
+      .aim-chat-log {
+        font-family: Arial, sans-serif;
+        font-size: 0.875rem;
+        line-height: 1.45;
+      }
+
+      .endpoint { overflow-wrap: anywhere; word-break: break-all; }
+
+      .aim-section-label {
+        font-size: 0.6875rem;
+        font-weight: bold;
+        text-transform: uppercase;
+        color: #000080;
+        border-bottom: 1px solid #808080;
+        margin-bottom: 3px;
+        padding-bottom: 1px;
       }
     </style>
   </head>
-  <body data-theme="dark" class="h-screen overflow-hidden bg-base-200">
-    <main class="grid h-screen grid-rows-[auto_minmax(0,1fr)] gap-3 p-3 md:gap-4 md:p-4">
-      <div class="navbar min-h-0 rounded-box border border-base-300 bg-base-100 px-4 shadow-sm">
-        <div>
-          <p class="text-sm font-semibold text-primary">Iroh WebRTC</p>
-          <h1 class="text-2xl font-bold tracking-tight md:text-3xl">Rust Browser Chat Room</h1>
-        </div>
-        <div class="ml-auto badge badge-outline badge-lg">WebRTC only</div>
-      </div>
-
-      <div class="grid min-h-0 gap-3 md:gap-4 lg:grid-cols-[24rem_minmax(0,1fr)]">
-        <section class="card min-h-0 border border-base-300 bg-base-100 shadow-sm" aria-label="Room controls">
-          <div class="card-body gap-4 overflow-auto">
-            <label class="form-control w-full">
-              <span class="label">
-                <span class="label-text font-semibold">Display name</span>
-              </span>
-              <input
-                id="name"
-                class="input input-bordered w-full"
-                autocomplete="name"
-                value="Browser peer"
-                maxlength="48"
-              />
-            </label>
-
-            <label class="form-control w-full">
-              <span class="label">
-                <span class="label-text font-semibold">Local endpoint</span>
-              </span>
-              <input
-                id="local"
-                class="input input-bordered w-full min-w-0 font-mono text-xs"
-                autocomplete="off"
-                spellcheck="false"
-                readonly
-              />
-            </label>
-
-            <label class="form-control w-full">
-              <span class="label">
-                <span class="label-text font-semibold">Host endpoint</span>
-              </span>
-              <input
-                id="host"
-                class="input input-bordered w-full min-w-0 font-mono text-xs"
-                autocomplete="off"
-                spellcheck="false"
-              />
-            </label>
-
-            <div class="join grid grid-cols-2">
-              <button id="host-room" class="btn btn-primary join-item">Host</button>
-              <button id="join-room" class="btn btn-secondary join-item">Join</button>
-            </div>
-
-            <div class="rounded-box border border-base-300 bg-base-200 p-3" aria-label="Gossip state">
-              <div class="text-xs font-bold uppercase tracking-wide text-base-content/60">
-                Gossip state
-              </div>
-              <div id="gossip-state" class="mt-3 space-y-2 text-sm"></div>
-            </div>
-
-            <div class="alert alert-soft overflow-clip mt-auto min-h-12 items-start">
-              <span id="status" class="text-sm"></span>
-            </div>
-          </div>
-        </section>
-
-        <section class="card min-h-0 border border-base-300 bg-base-100 shadow-sm" aria-label="Chat room">
-          <div class="card-body grid min-h-0 grid-rows-[auto_minmax(0,1fr)_auto] gap-4">
-            <div class="grid min-h-0 gap-3 md:grid-cols-[minmax(0,1fr)_18rem]">
-              <div class="rounded-box border border-base-300 bg-base-200 p-3">
-                <div class="text-xs font-bold uppercase tracking-wide text-base-content/60">
-                  Room endpoint
-                </div>
-                <div id="room-endpoint" class="endpoint mt-1 max-h-20 overflow-auto font-mono text-xs">
-                  Not connected
-                </div>
-              </div>
-
-              <div class="rounded-box border border-base-300 bg-base-200 p-3">
-                <div class="text-xs font-bold uppercase tracking-wide text-base-content/60">
-                  Participants
-                </div>
-                <ul id="participants" class="mt-2 flex flex-wrap gap-2"></ul>
-              </div>
-            </div>
-
-            <div
-              id="messages"
-              class="rounded-box min-h-0 overflow-auto border border-base-300 bg-base-200 p-4"
-              aria-live="polite"
-            ></div>
-
-            <div class="grid gap-3 md:grid-cols-[minmax(0,1fr)_7rem] md:items-end">
-              <label class="form-control w-full">
-                <span class="label">
-                  <span class="label-text font-semibold">Message</span>
-                </span>
-                <textarea
-                  id="message"
-                  class="textarea w-full textarea-bordered min-h-24 resize-y"
-                  disabled
-                  maxlength="2000"
-                ></textarea>
-              </label>
-              <button id="send" class="btn btn-accent" disabled>Send</button>
-            </div>
-          </div>
-        </section>
-      </div>
-    </main>
+  <body class="h-screen overflow-hidden bg-[#c0c0c0]">
+    <div id="app" class="h-full"></div>
   </body>
 </html>

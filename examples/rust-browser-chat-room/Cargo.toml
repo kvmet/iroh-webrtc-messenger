@@ -20,6 +20,8 @@ tokio = { version = "1", features = ["sync"] }
 wasm-bindgen = "=0.2.118"
 wasm-bindgen-futures = "0.4"
 web-sys = { version = "0.3", features = [
+  "Crypto",
+  "CryptoKey",
   "Document",
   "Element",
   "Event",
@@ -30,5 +32,11 @@ web-sys = { version = "0.3", features = [
   "KeyboardEvent",
   "Location",
   "Node",
+  "Storage",
+  "SubtleCrypto",
+  "TextEncoder",
   "Window",
 ] }
+yew = { version = "0.23.0", features = ["csr"] }
+base64 = "0.22.1"
+js-sys = "0.3"
