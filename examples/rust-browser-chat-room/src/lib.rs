@@ -1386,7 +1386,7 @@ fn chat_room(props: &ChatRoomProps) -> Html {
                     <div class="border-t-2 border-t-[#808080] p-2 flex gap-2 items-end bg-[#c0c0c0]">
                         <textarea
                             class={classes!(
-                                "aim-inset", "flex-1", "p-1", "text-sm", "h-16", "resize-none",
+                                "aim-inset", "flex-1", "p-1", "text-sm", "h-10", "md:h-16", "resize-none",
                                 "font-[Arial,sans-serif]",
                                 if !can_send { "opacity-60" } else { "" }
                             )}
