@@ -33,6 +33,7 @@ use yew::prelude::*;
 const STORAGE_ENC: &str = "iroh.id.enc";
 const STORAGE_SALT: &str = "iroh.id.salt";
 const STORAGE_NAME: &str = "iroh.name";
+const STORAGE_ROOMS: &str = "iroh.rooms";
 
 // ── Entry point ───────────────────────────────────────────────────────────────
 
@@ -203,6 +204,78 @@ async fn decrypt_key(
         .to_vec()
         .try_into()
         .map_err(|_| JsValue::from_str("decrypted key has wrong length"))
+}
+
+async fn raw_aes_key(key_bytes: &[u8; 32], usage: &str) -> std::result::Result<web_sys::CryptoKey, JsValue> {
+    let subtle = web_sys::window()
+        .ok_or_else(|| JsValue::from_str("no window"))?
+        .crypto()?
+        .subtle();
+    let arr = Uint8Array::from(key_bytes.as_slice());
+    let usages = Array::of1(&JsValue::from_str(usage));
+    JsFuture::from(subtle.import_key_with_str("raw", arr.unchecked_ref::<Object>(), "AES-GCM", false, &usages)?)
+        .await?
+        .dyn_into()
+}
+
+async fn encrypt_data(data: &[u8], key_bytes: &[u8; 32]) -> std::result::Result<Vec<u8>, JsValue> {
+    let crypto = web_sys::window().ok_or_else(|| JsValue::from_str("no window"))?.crypto()?;
+    let iv_arr = Uint8Array::new_with_length(12);
+    crypto.get_random_values_with_array_buffer_view(&iv_arr)?;
+    let iv = iv_arr.to_vec();
+    let cipher_key = raw_aes_key(key_bytes, "encrypt").await?;
+    let params = Object::new();
+    Reflect::set(&params, &"name".into(), &"AES-GCM".into())?;
+    Reflect::set(&params, &"iv".into(), &Uint8Array::from(iv.as_slice()))?;
+    let subtle = crypto.subtle();
+    let ct = JsFuture::from(subtle.encrypt_with_object_and_buffer_source(
+        &params, &cipher_key, &Uint8Array::from(data),
+    )?).await?;
+    let mut result = iv;
+    result.extend_from_slice(&Uint8Array::new(&ct).to_vec());
+    Ok(result)
+}
+
+async fn decrypt_data(encrypted: &[u8], key_bytes: &[u8; 32]) -> std::result::Result<Vec<u8>, JsValue> {
+    let iv = &encrypted[..12];
+    let ct = &encrypted[12..];
+    let cipher_key = raw_aes_key(key_bytes, "decrypt").await?;
+    let params = Object::new();
+    Reflect::set(&params, &"name".into(), &"AES-GCM".into())?;
+    Reflect::set(&params, &"iv".into(), &Uint8Array::from(iv))?;
+    let subtle = web_sys::window().ok_or_else(|| JsValue::from_str("no window"))?.crypto()?.subtle();
+    let pt = JsFuture::from(subtle.decrypt_with_object_and_buffer_source(
+        &params, &cipher_key, &Uint8Array::from(ct),
+    )?).await?;
+    Ok(Uint8Array::new(&pt).to_vec())
+}
+
+#[derive(Serialize, Deserialize)]
+struct RoomSave {
+    topic_b64: String,
+    name: String,
+    hosting: bool,
+}
+
+async fn save_rooms(rooms: &[RoomState], key_bytes: &[u8; 32]) {
+    let saves: Vec<RoomSave> = rooms.iter().map(|r| RoomSave {
+        topic_b64: BASE64.encode(r.topic_bytes),
+        name: r.name.clone(),
+        hosting: r.mode == RoomMode::Hosting,
+    }).collect();
+    let Ok(json) = serde_json::to_vec(&saves) else { return };
+    let Ok(enc) = encrypt_data(&json, key_bytes).await else { return };
+    if let Ok(s) = local_storage() {
+        let _ = s.set_item(STORAGE_ROOMS, &BASE64.encode(&enc));
+    }
+}
+
+async fn load_rooms(key_bytes: &[u8; 32]) -> Vec<RoomSave> {
+    let Ok(s) = local_storage() else { return vec![] };
+    let Some(b64) = s.get_item(STORAGE_ROOMS).ok().flatten() else { return vec![] };
+    let Ok(enc) = BASE64.decode(&b64) else { return vec![] };
+    let Ok(json) = decrypt_data(&enc, key_bytes).await else { return vec![] };
+    serde_json::from_slice(&json).unwrap_or_default()
 }
 
 // ── Gossip protocol ───────────────────────────────────────────────────────────
@@ -483,6 +556,7 @@ fn app() -> Html {
     let phase = use_state(|| AppPhase::Checking);
     let node_ref: Rc<RefCell<Option<NodeHandle>>> = use_mut_ref(|| None);
     let chat_state = use_state(AppState::default);
+    let identity_key = use_state(|| [0u8; 32]);
 
     // Check localStorage on mount
     {
@@ -503,18 +577,37 @@ fn app() -> Html {
         let phase = phase.clone();
         let node_ref = node_ref.clone();
         let chat_state = chat_state.clone();
+        let identity_key = identity_key.clone();
         use_effect_with(phase_val, move |p| {
             if let AppPhase::SpawningNode(key_bytes) = p {
                 let key_bytes = *key_bytes;
                 let phase = phase.clone();
                 let node_ref = node_ref.clone();
                 let chat_state = chat_state.clone();
+                let identity_key = identity_key.clone();
                 spawn_local(async move {
+                    identity_key.set(key_bytes);
+                    let saved = load_rooms(&key_bytes).await;
                     match init_node(key_bytes).await {
                         Ok(handle) => {
                             let gossip = handle.gossip.clone();
                             let ep = handle.endpoint_id.clone();
                             *node_ref.borrow_mut() = Some(handle);
+                            let mut initial = AppState::default();
+                            initial.rooms = saved.into_iter().map(|s| {
+                                let topic_bytes: [u8; 32] = BASE64.decode(&s.topic_b64)
+                                    .ok().and_then(|b| b.try_into().ok()).unwrap_or([0u8; 32]);
+                                RoomState {
+                                    topic_id: TopicId::from_bytes(topic_bytes).to_string(),
+                                    topic_bytes,
+                                    name: s.name,
+                                    mode: if s.hosting { RoomMode::Hosting } else { RoomMode::Joined },
+                                    messages: vec![sys_msg("Restored. Re-join to connect.")],
+                                    participants: vec![],
+                                    joined: false,
+                                }
+                            }).collect();
+                            chat_state.set(initial);
                             let state = chat_state.clone();
                             spawn_local(async move {
                                 gossip_event_loop(gossip, ep, state).await;
@@ -588,6 +681,8 @@ fn app() -> Html {
                 .map(|h| (h.endpoint_id.clone(), h.gossip.clone()));
             if let Some((endpoint_id, gossip)) = handle_data {
                 let state = (*chat_state).clone();
+                let key_bytes = *identity_key;
+                let persistent = load_stored().is_some();
                 let on_host = {
                     let gossip = gossip.clone();
                     let chat_state = chat_state.clone();
@@ -624,7 +719,7 @@ fn app() -> Html {
                     })
                 };
                 html! {
-                    <ChatRoom {endpoint_id} {state} {on_host} {on_join} {on_send} {on_switch_room} />
+                    <ChatRoom {endpoint_id} {state} {key_bytes} {persistent} {on_host} {on_join} {on_send} {on_switch_room} />
                 }
             } else {
                 html! { <div class="p-4 text-red-600">{"Error: node handle missing"}</div> }
@@ -784,10 +879,13 @@ fn new_user_setup(props: &NewUserSetupProps) -> Html {
                     </div>
                     <input
                         type="password"
-                        class="aim-input mb-4"
+                        class="aim-input mb-2"
                         oninput={on_pass}
                         onkeydown={on_keydown}
                     />
+                    <p class="text-[10px] text-gray-500 mb-4">
+                        {"Without a passphrase your identity and chats are not saved. You will get a new handle every session."}
+                    </p>
                     <button class="aim-btn w-full" onclick={on_go}>{"Create & Sign On"}</button>
                 </div>
             </div>
@@ -801,6 +899,8 @@ fn new_user_setup(props: &NewUserSetupProps) -> Html {
 struct ChatRoomProps {
     endpoint_id: String,
     state: AppState,
+    key_bytes: [u8; 32],
+    persistent: bool,
     on_host: Callback<(String, String, String)>,     // (topic_b64, room_name, screen_name)
     on_join: Callback<(String, String, String)>,     // (invite, room_name, screen_name)
     on_send: Callback<(String, String, String)>,     // (text, name, topic_id)
@@ -835,6 +935,19 @@ fn chat_room(props: &ChatRoomProps) -> Html {
             let path = loc.pathname().ok()?;
             Some(format!("{}{}#{}|{}", origin, path, topic_b64, props.endpoint_id))
         });
+
+    // Save rooms whenever the room list changes (only if identity is persisted)
+    use_effect_with(props.state.rooms.len(), {
+        let key_bytes = props.key_bytes;
+        let rooms = props.state.rooms.clone();
+        let persistent = props.persistent;
+        move |_| {
+            if persistent {
+                spawn_local(async move { save_rooms(&rooms, &key_bytes).await; });
+            }
+            || ()
+        }
+    });
 
     // Auto-scroll on new messages in active room
     let active_msg_count = active_room.map_or(0, |r| r.messages.len());
@@ -961,6 +1074,12 @@ fn chat_room(props: &ChatRoomProps) -> Html {
                             maxlength="32"
                         />
                     </div>
+
+                    if !props.persistent {
+                        <div class="p-1 px-2 bg-[#ffff80] border-b border-[#808080] text-[10px] leading-tight">
+                            {"No passphrase set — chats won't persist across sessions."}
+                        </div>
+                    }
 
                     <div class="p-2 border-b border-[#808080]">
                         <div class="aim-section-label">{"New Chat"}</div>
