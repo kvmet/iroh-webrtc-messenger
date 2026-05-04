@@ -34,7 +34,7 @@ use yew::prelude::*;
 const STORAGE_ENC: &str = "iroh.id.enc";
 const STORAGE_SALT: &str = "iroh.id.salt";
 const STORAGE_NAME: &str = "iroh.name";
-const STORAGE_ROOMS: &str = "iroh.rooms";
+const STORAGE_PROFILE: &str = "iroh.profile";
 
 // ── Entry point ───────────────────────────────────────────────────────────────
 
@@ -121,7 +121,7 @@ async fn aes_key(
     let pbkdf2 = Object::new();
     Reflect::set(&pbkdf2, &"name".into(), &"PBKDF2".into())?;
     Reflect::set(&pbkdf2, &"salt".into(), &Uint8Array::from(salt))?;
-    Reflect::set(&pbkdf2, &"iterations".into(), &JsValue::from(100_000u32))?;
+    Reflect::set(&pbkdf2, &"iterations".into(), &JsValue::from(600_000u32))?;
     Reflect::set(&pbkdf2, &"hash".into(), &"SHA-256".into())?;
 
     let aes_spec = Object::new();
@@ -182,6 +182,9 @@ async fn decrypt_key(
     salt: &[u8],
     passphrase: &str,
 ) -> std::result::Result<[u8; 32], JsValue> {
+    if encrypted.len() < 13 {
+        return Err(JsValue::from_str("ciphertext too short"));
+    }
     let iv = &encrypted[..12];
     let ct = &encrypted[12..];
 
@@ -238,6 +241,9 @@ async fn encrypt_data(data: &[u8], key_bytes: &[u8; 32]) -> std::result::Result<
 }
 
 async fn decrypt_data(encrypted: &[u8], key_bytes: &[u8; 32]) -> std::result::Result<Vec<u8>, JsValue> {
+    if encrypted.len() < 13 {
+        return Err(JsValue::from_str("ciphertext too short"));
+    }
     let iv = &encrypted[..12];
     let ct = &encrypted[12..];
     let cipher_key = raw_aes_key(key_bytes, "decrypt").await?;
@@ -258,6 +264,20 @@ struct RoomSave {
     hosting: bool,
     #[serde(default)]
     bootstrap_peers: Vec<String>,
+}
+
+fn decode_topic_b64(s: &str) -> Option<[u8; 32]> {
+    BASE64.decode(s).ok()?.try_into().ok()
+}
+
+/// Parse an invite into (topic_bytes, host_endpoint). Accepts either the bare
+/// `topic_b64|endpoint` payload or a full URL ending in that hash.
+fn parse_invite(invite: &str) -> Option<([u8; 32], String)> {
+    let payload = invite.find('#').map_or(invite, |i| &invite[i + 1..]).trim();
+    let (topic_b64, host) = payload.split_once('|')?;
+    let host = host.trim();
+    if host.is_empty() { return None; }
+    Some((decode_topic_b64(topic_b64)?, host.to_string()))
 }
 
 fn make_invite_url(topic_bytes: [u8; 32], endpoint_id: &str) -> Option<String> {
@@ -288,26 +308,49 @@ fn copy_to_clipboard(text: &str) {
     });
 }
 
-async fn save_rooms(rooms: &[RoomState], key_bytes: &[u8; 32]) {
+#[derive(Serialize, Deserialize, Default)]
+struct Profile {
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    rooms: Vec<RoomSave>,
+}
+
+async fn save_profile(name: &str, rooms: &[RoomState], key_bytes: &[u8; 32]) {
     let saves: Vec<RoomSave> = rooms.iter().map(|r| RoomSave {
         topic_b64: BASE64.encode(r.topic_bytes),
         name: r.name.clone(),
         hosting: r.mode == RoomMode::Hosting,
         bootstrap_peers: r.bootstrap_peers.clone(),
     }).collect();
-    let Ok(json) = serde_json::to_vec(&saves) else { return };
+    let profile = Profile { name: name.to_string(), rooms: saves };
+    let Ok(json) = serde_json::to_vec(&profile) else { return };
     let Ok(enc) = encrypt_data(&json, key_bytes).await else { return };
     if let Ok(s) = local_storage() {
-        let _ = s.set_item(STORAGE_ROOMS, &BASE64.encode(&enc));
+        let _ = s.set_item(STORAGE_PROFILE, &BASE64.encode(&enc));
+        let _ = s.remove_item(STORAGE_NAME);  // clean plaintext leftover
     }
 }
 
-async fn load_rooms(key_bytes: &[u8; 32]) -> Vec<RoomSave> {
-    let Ok(s) = local_storage() else { return vec![] };
-    let Some(b64) = s.get_item(STORAGE_ROOMS).ok().flatten() else { return vec![] };
-    let Ok(enc) = BASE64.decode(&b64) else { return vec![] };
-    let Ok(json) = decrypt_data(&enc, key_bytes).await else { return vec![] };
+async fn load_profile(key_bytes: &[u8; 32]) -> Profile {
+    let Ok(s) = local_storage() else { return Profile::default() };
+    let Some(b64) = s.get_item(STORAGE_PROFILE).ok().flatten() else { return Profile::default() };
+    let Ok(enc) = BASE64.decode(&b64) else { return Profile::default() };
+    let Ok(json) = decrypt_data(&enc, key_bytes).await else { return Profile::default() };
     serde_json::from_slice(&json).unwrap_or_default()
+}
+
+// ── Wire limits ───────────────────────────────────────────────────────────────
+
+const MAX_WIRE_BYTES: usize = 8192;
+const MAX_NAME_CHARS: usize = 32;
+const MAX_TEXT_CHARS: usize = 4000;
+
+fn truncate_chars(s: &mut String, max: usize) {
+    if s.chars().count() > max {
+        let cutoff = s.char_indices().nth(max).map(|(i, _)| i).unwrap_or(s.len());
+        s.truncate(cutoff);
+    }
 }
 
 // ── Gossip protocol ───────────────────────────────────────────────────────────
@@ -427,18 +470,22 @@ impl BrowserProtocol for ChatGossipProtocol {
                                 });
                             }
                             Ok(GossipEvent::Received(msg)) => {
+                                if msg.content.len() > MAX_WIRE_BYTES { continue; }
                                 if let Ok(wire) =
                                     serde_json::from_slice::<ChatWireMessage>(&msg.content)
                                 {
                                     match wire {
-                                        ChatWireMessage::AboutMe { endpoint, name } => {
+                                        ChatWireMessage::AboutMe { endpoint, mut name } => {
+                                            truncate_chars(&mut name, MAX_NAME_CHARS);
                                             let _ = events.send(ChatGossipEvent::Identify {
                                                 topic: topic_for_task.clone(),
                                                 endpoint,
                                                 name,
                                             });
                                         }
-                                        ChatWireMessage::Chat { from_endpoint, from_name, text } => {
+                                        ChatWireMessage::Chat { from_endpoint, mut from_name, mut text } => {
+                                            truncate_chars(&mut from_name, MAX_NAME_CHARS);
+                                            truncate_chars(&mut text, MAX_TEXT_CHARS);
                                             let _ = events.send(ChatGossipEvent::Chat {
                                                 topic: topic_for_task.clone(),
                                                 from_endpoint,
@@ -535,7 +582,7 @@ fn error_from_display(e: impl std::fmt::Display) -> Error {
 
 // ── App state types ───────────────────────────────────────────────────────────
 
-#[derive(Clone, PartialEq, Debug)]
+#[derive(Clone, PartialEq)]
 enum AppPhase {
     Checking,
     NeedPassphrase,
@@ -574,7 +621,98 @@ struct RoomState {
 struct AppState {
     rooms: Vec<RoomState>,
     active_topic: Option<String>,
-    local_name: String,
+    /// Bootstrap value from the encrypted profile; ChatRoom owns the live name state.
+    name: String,
+    join_error: Option<String>,
+}
+
+enum Action {
+    SetInitial(AppState),
+    AddRoom(RoomState),
+    SetActive(String),
+    LocalSend { topic: String, msg: ChatMsg },
+    Joined(String),
+    NeighborUp { topic: String, endpoint: String },
+    NeighborDown { topic: String, endpoint: String },
+    RecvChat { topic: String, from_endpoint: String, from_name: String, text: String },
+    System { topic: String, text: String },
+    Identify { topic: String, endpoint: String, name: String },
+    SetJoinError(Option<String>),
+}
+
+impl Reducible for AppState {
+    type Action = Action;
+    fn reduce(self: Rc<Self>, action: Self::Action) -> Rc<Self> {
+        let mut s = (*self).clone();
+        match action {
+            Action::SetInitial(new_state) => return Rc::new(new_state),
+            Action::AddRoom(r) => {
+                s.join_error = None;
+                if s.rooms.iter().any(|x| x.topic_id == r.topic_id) {
+                    s.active_topic = Some(r.topic_id);
+                } else {
+                    s.active_topic = Some(r.topic_id.clone());
+                    s.rooms.push(r);
+                }
+            }
+            Action::SetActive(topic) => {
+                s.active_topic = Some(topic);
+            }
+            Action::LocalSend { topic, msg } => {
+                if let Some(r) = s.rooms.iter_mut().find(|r| r.topic_id == topic) {
+                    r.messages.push(msg);
+                }
+            }
+            Action::Joined(topic) => {
+                if let Some(r) = s.rooms.iter_mut().find(|r| r.topic_id == topic) {
+                    r.joined = true;
+                }
+            }
+            Action::NeighborUp { topic, endpoint } => {
+                if let Some(r) = s.rooms.iter_mut().find(|r| r.topic_id == topic) {
+                    if !r.participants.contains(&endpoint) {
+                        r.participants.push(endpoint);
+                    }
+                }
+            }
+            Action::NeighborDown { topic, endpoint } => {
+                if let Some(r) = s.rooms.iter_mut().find(|r| r.topic_id == topic) {
+                    r.participants.retain(|p| p != &endpoint);
+                    let display = r.names.get(&endpoint).cloned()
+                        .unwrap_or_else(|| {
+                            let short: String = endpoint.chars().take(12).collect();
+                            format!("{short}…")
+                        });
+                    r.messages.push(sys_msg(&format!("*** {display} left")));
+                }
+            }
+            Action::RecvChat { topic, from_endpoint, from_name, text } => {
+                if let Some(r) = s.rooms.iter_mut().find(|r| r.topic_id == topic) {
+                    // Pin name on first sighting; later messages can't rename a peer
+                    r.names.entry(from_endpoint.clone()).or_insert_with(|| from_name.clone());
+                    r.messages.push(ChatMsg { from_endpoint, from_name, text, is_system: false });
+                }
+            }
+            Action::System { topic, text } => {
+                if let Some(r) = s.rooms.iter_mut().find(|r| r.topic_id == topic) {
+                    r.messages.push(sys_msg(&text));
+                }
+            }
+            Action::Identify { topic, endpoint, name } => {
+                if let Some(r) = s.rooms.iter_mut().find(|r| r.topic_id == topic) {
+                    // First Identify wins; ignore later renames to prevent impersonation
+                    if !r.names.contains_key(&endpoint) {
+                        r.names.insert(endpoint, name.clone());
+                        r.messages.push(sys_msg(&format!("*** {name} joined")));
+                    }
+                }
+            }
+            Action::SetJoinError(err) => {
+                s.join_error = err;
+            }
+        }
+        Rc::new(s)
+    }
 }
 
 #[derive(Clone, PartialEq)]
@@ -591,8 +729,9 @@ struct ChatMsg {
 fn app() -> Html {
     let phase = use_state(|| AppPhase::Checking);
     let node_ref: Rc<RefCell<Option<NodeHandle>>> = use_mut_ref(|| None);
-    let chat_state = use_state(AppState::default);
+    let chat_state = use_reducer(AppState::default);
     let identity_key = use_state(|| [0u8; 32]);
+    let passphrase_error: UseStateHandle<Option<String>> = use_state(|| None);
 
     // Check localStorage on mount
     {
@@ -623,14 +762,14 @@ fn app() -> Html {
                 let identity_key = identity_key.clone();
                 spawn_local(async move {
                     identity_key.set(key_bytes);
-                    let saved = load_rooms(&key_bytes).await;
+                    let profile = load_profile(&key_bytes).await;
                     match init_node(key_bytes).await {
                         Ok(handle) => {
                             let gossip = handle.gossip.clone();
                             let ep = handle.endpoint_id.clone();
-                            let local_name = stored_name();
+                            let local_name = if profile.name.is_empty() { stored_name() } else { profile.name.clone() };
                             *node_ref.borrow_mut() = Some(handle);
-                            let restored: Vec<RoomState> = saved.into_iter().map(|s| {
+                            let restored: Vec<RoomState> = profile.rooms.into_iter().map(|s| {
                                 let topic_bytes: [u8; 32] = BASE64.decode(&s.topic_b64)
                                     .ok().and_then(|b| b.try_into().ok()).unwrap_or([0u8; 32]);
                                 RoomState {
@@ -646,10 +785,10 @@ fn app() -> Html {
                                 }
                             }).collect();
                             let mut initial = AppState::default();
-                            initial.local_name = local_name.clone();
                             initial.active_topic = restored.first().map(|r| r.topic_id.clone());
                             initial.rooms = restored.clone();
-                            chat_state.set(initial);
+                            initial.name = local_name.clone();
+                            chat_state.dispatch(Action::SetInitial(initial));
 
                             // Auto-rejoin restored rooms
                             for r in &restored {
@@ -686,13 +825,18 @@ fn app() -> Html {
         AppPhase::NeedPassphrase => {
             let on_submit = {
                 let phase = phase.clone();
+                let passphrase_error = passphrase_error.clone();
                 Callback::from(move |pass: String| {
                     let phase = phase.clone();
+                    let passphrase_error = passphrase_error.clone();
                     spawn_local(async move {
                         match load_stored() {
                             Some((enc, salt)) => match decrypt_key(&enc, &salt, &pass).await {
-                                Ok(kb) => phase.set(AppPhase::SpawningNode(kb)),
-                                Err(_) => phase.set(AppPhase::Failed("Wrong passphrase.".into())),
+                                Ok(kb) => {
+                                    passphrase_error.set(None);
+                                    phase.set(AppPhase::SpawningNode(kb));
+                                }
+                                Err(_) => passphrase_error.set(Some("Wrong passphrase.".into())),
                             },
                             None => phase.set(AppPhase::NewUser),
                         }
@@ -706,7 +850,8 @@ fn app() -> Html {
                     phase.set(AppPhase::NewUser);
                 })
             };
-            html! { <PassphraseGate {on_submit} {on_forget} /> }
+            let error = (*passphrase_error).clone();
+            html! { <PassphraseGate {on_submit} {on_forget} {error} /> }
         }
         AppPhase::NewUser => {
             let on_ready = {
@@ -736,6 +881,7 @@ fn app() -> Html {
                 let state = (*chat_state).clone();
                 let key_bytes = *identity_key;
                 let persistent = load_stored().is_some();
+                let initial_name = if state.name.is_empty() { stored_name() } else { state.name.clone() };
                 let on_host = {
                     let gossip = gossip.clone();
                     let chat_state = chat_state.clone();
@@ -751,8 +897,16 @@ fn app() -> Html {
                     let ep = endpoint_id.clone();
                     Callback::from(move |(invite, room_name, name): (String, String, String)| {
                         let (g, cs, ep) = (gossip.clone(), chat_state.clone(), ep.clone());
-                        spawn_local(async move { do_join(g, ep, invite, room_name, name, cs).await; });
+                        spawn_local(async move {
+                            if let Err(msg) = do_join(g, ep, invite, room_name, name, cs.clone()).await {
+                                cs.dispatch(Action::SetJoinError(Some(msg)));
+                            }
+                        });
                     })
+                };
+                let on_clear_error = {
+                    let chat_state = chat_state.clone();
+                    Callback::from(move |_: ()| chat_state.dispatch(Action::SetJoinError(None)))
                 };
                 let on_send = {
                     let gossip = gossip.clone();
@@ -766,13 +920,11 @@ fn app() -> Html {
                 let on_switch_room = {
                     let chat_state = chat_state.clone();
                     Callback::from(move |topic_id: String| {
-                        let mut s = (*chat_state).clone();
-                        s.active_topic = Some(topic_id);
-                        chat_state.set(s);
+                        chat_state.dispatch(Action::SetActive(topic_id));
                     })
                 };
                 html! {
-                    <ChatRoom {endpoint_id} {state} {key_bytes} {persistent} {on_host} {on_join} {on_send} {on_switch_room} />
+                    <ChatRoom {endpoint_id} {state} {key_bytes} {persistent} {initial_name} {on_host} {on_join} {on_send} {on_switch_room} {on_clear_error} />
                 }
             } else {
                 html! { <div class="p-4 text-red-600">{"Error: node handle missing"}</div> }
@@ -795,6 +947,7 @@ fn app() -> Html {
 struct PassphraseGateProps {
     on_submit: Callback<String>,
     on_forget: Callback<()>,
+    error: Option<String>,
 }
 
 #[function_component(PassphraseGate)]
@@ -842,6 +995,9 @@ fn passphrase_gate(props: &PassphraseGateProps) -> Html {
                         onkeydown={on_keydown}
                         autofocus=true
                     />
+                    if let Some(err) = props.error.clone() {
+                        <div class="text-[11px] text-red-700 mb-2">{err}</div>
+                    }
                     <button class="aim-btn w-full" onclick={on_sign_on}>{"Sign On"}</button>
                     <button
                         class="mt-3 block text-xs text-blue-700 underline cursor-pointer bg-transparent border-0 p-0"
@@ -881,11 +1037,11 @@ fn new_user_setup(props: &NewUserSetupProps) -> Html {
             pass.set(el.value());
         })
     };
-    let on_go = {
+    let submit = {
         let name = name.clone();
         let pass = pass.clone();
         let cb = props.on_ready.clone();
-        Callback::from(move |_: MouseEvent| {
+        std::rc::Rc::new(move || {
             let n = (*name).clone();
             save_name(&n);
             let key_bytes = SecretKey::generate().to_bytes();
@@ -893,18 +1049,14 @@ fn new_user_setup(props: &NewUserSetupProps) -> Html {
             cb.emit((key_bytes, p));
         })
     };
+    let on_go = {
+        let f = submit.clone();
+        Callback::from(move |_: MouseEvent| f())
+    };
     let on_keydown = {
-        let name = name.clone();
-        let pass = pass.clone();
-        let cb = props.on_ready.clone();
+        let f = submit.clone();
         Callback::from(move |e: KeyboardEvent| {
-            if e.key() == "Enter" {
-                let n = (*name).clone();
-                save_name(&n);
-                let key_bytes = SecretKey::generate().to_bytes();
-                let p = if (*pass).is_empty() { None } else { Some((*pass).clone()) };
-                cb.emit((key_bytes, p));
-            }
+            if e.key() == "Enter" { f(); }
         })
     };
 
@@ -954,15 +1106,20 @@ struct ChatRoomProps {
     state: AppState,
     key_bytes: [u8; 32],
     persistent: bool,
+    initial_name: String,
     on_host: Callback<(String, String, String)>,     // (topic_b64, room_name, screen_name)
     on_join: Callback<(String, String, String)>,     // (invite, room_name, screen_name)
     on_send: Callback<(String, String, String)>,     // (text, name, topic_id)
     on_switch_room: Callback<String>,               // topic_id
+    on_clear_error: Callback<()>,
 }
 
 #[function_component(ChatRoom)]
 fn chat_room(props: &ChatRoomProps) -> Html {
-    let name = use_state(stored_name);
+    let name = use_state({
+        let n = props.initial_name.clone();
+        move || n
+    });
     let host_input = use_state(|| {
         web_sys::window()
             .and_then(|w| w.location().hash().ok())
@@ -997,22 +1154,24 @@ fn chat_room(props: &ChatRoomProps) -> Html {
     let can_send = active_room.map_or(false, |r| r.joined);
 
 
-    // Save rooms whenever the room list changes (only if identity is persisted)
-    use_effect_with(props.state.rooms.len(), {
+    // Save profile (name + rooms) whenever they change, if persistent
+    use_effect_with(((*name).clone(), props.state.rooms.len()), {
         let key_bytes = props.key_bytes;
         let rooms = props.state.rooms.clone();
+        let n = (*name).clone();
         let persistent = props.persistent;
         move |_| {
             if persistent {
-                spawn_local(async move { save_rooms(&rooms, &key_bytes).await; });
+                spawn_local(async move { save_profile(&n, &rooms, &key_bytes).await; });
             }
             || ()
         }
     });
 
-    // Auto-scroll on new messages in active room
+    // Auto-scroll on new messages or when switching active room
     let active_msg_count = active_room.map_or(0, |r| r.messages.len());
-    use_effect_with(active_msg_count, {
+    let scroll_dep = (active_topic_id.clone(), active_msg_count);
+    use_effect_with(scroll_dep, {
         let r = messages_ref.clone();
         move |_| {
             if let Some(el) = r.cast::<HtmlElement>() {
@@ -1024,10 +1183,11 @@ fn chat_room(props: &ChatRoomProps) -> Html {
 
     let on_name_input = {
         let name = name.clone();
+        let persistent = props.persistent;
         Callback::from(move |e: InputEvent| {
             let el: HtmlInputElement = e.target_unchecked_into();
             let v = el.value();
-            save_name(&v);
+            if !persistent { save_name(&v); }
             name.set(v);
         })
     };
@@ -1053,35 +1213,58 @@ fn chat_room(props: &ChatRoomProps) -> Html {
         })
     };
 
-    let on_host_click = {
+    let submit_host = {
         let name = name.clone();
         let room_name_input = room_name_input.clone();
         let show_host_modal = show_host_modal.clone();
         let cb = props.on_host.clone();
-        Callback::from(move |_: MouseEvent| {
+        std::rc::Rc::new(move || {
             let mut topic_bytes = [0u8; 32];
-            if let Ok(crypto) = web_sys::window().unwrap().crypto() {
-                let arr = Uint8Array::new_with_length(32);
-                let _ = crypto.get_random_values_with_array_buffer_view(&arr);
-                arr.copy_to(&mut topic_bytes);
+            if let Some(window) = web_sys::window() {
+                if let Ok(crypto) = window.crypto() {
+                    let arr = Uint8Array::new_with_length(32);
+                    let _ = crypto.get_random_values_with_array_buffer_view(&arr);
+                    arr.copy_to(&mut topic_bytes);
+                }
             }
             let topic_b64 = BASE64.encode(topic_bytes);
             cb.emit((topic_b64, (*room_name_input).clone(), (*name).clone()));
             show_host_modal.set(false);
         })
     };
-    let on_join_click = {
+    let submit_join = {
         let name = name.clone();
         let host_input = host_input.clone();
         let room_name_input = room_name_input.clone();
         let show_join_modal = show_join_modal.clone();
         let cb = props.on_join.clone();
-        Callback::from(move |_: MouseEvent| {
+        std::rc::Rc::new(move || {
             let h = (*host_input).trim().to_string();
             if !h.is_empty() {
                 cb.emit((h, (*room_name_input).clone(), (*name).clone()));
                 show_join_modal.set(false);
             }
+        })
+    };
+
+    let on_host_click = {
+        let f = submit_host.clone();
+        Callback::from(move |_: MouseEvent| f())
+    };
+    let on_host_keydown = {
+        let f = submit_host.clone();
+        Callback::from(move |e: KeyboardEvent| {
+            if e.key() == "Enter" { e.prevent_default(); f(); }
+        })
+    };
+    let on_join_click = {
+        let f = submit_join.clone();
+        Callback::from(move |_: MouseEvent| f())
+    };
+    let on_join_keydown = {
+        let f = submit_join.clone();
+        Callback::from(move |e: KeyboardEvent| {
+            if e.key() == "Enter" { e.prevent_default(); f(); }
         })
     };
 
@@ -1163,8 +1346,9 @@ fn chat_room(props: &ChatRoomProps) -> Html {
                         </div>
                         <div class="p-3">
                             <div class="text-xs font-bold mb-1">{"Room name"}</div>
-                            <input type="text" class="aim-input mb-3"
+                            <input type="text" class="aim-input mb-3" autofocus=true
                                 value={(*room_name_input).clone()} oninput={on_room_name_input.clone()}
+                                onkeydown={on_host_keydown}
                                 placeholder="general" />
                             <div class="flex gap-1 justify-end">
                                 <button class="aim-btn"
@@ -1192,8 +1376,9 @@ fn chat_room(props: &ChatRoomProps) -> Html {
                         </div>
                         <div class="p-3">
                             <div class="text-xs font-bold mb-1">{"Invite link"}</div>
-                            <input type="text" class="aim-input text-[10px] font-mono mb-3"
+                            <input type="text" class="aim-input text-[10px] font-mono mb-3" autofocus=true
                                 value={(*host_input).clone()} oninput={on_host_input}
+                                onkeydown={on_join_keydown.clone()}
                                 placeholder="paste invite link" spellcheck="false" />
                             <div class="text-xs font-bold mb-1">
                                 {"Room name "}
@@ -1201,7 +1386,11 @@ fn chat_room(props: &ChatRoomProps) -> Html {
                             </div>
                             <input type="text" class="aim-input mb-3"
                                 value={(*room_name_input).clone()} oninput={on_room_name_input.clone()}
+                                onkeydown={on_join_keydown}
                                 placeholder="general" />
+                            if let Some(err) = props.state.join_error.clone() {
+                                <div class="text-[11px] text-red-700 mb-2">{err}</div>
+                            }
                             <div class="flex gap-1 justify-end">
                                 <button class="aim-btn"
                                     onclick={Callback::from({let s = show_join_modal.clone(); move |_: MouseEvent| s.set(false)})}>
@@ -1212,6 +1401,12 @@ fn chat_room(props: &ChatRoomProps) -> Html {
                         </div>
                     </div>
                 </div>
+            }
+
+            // Outside-click catcher for meatball menu
+            if open_menu.is_some() {
+                <div class="fixed inset-0" style="z-index:25"
+                    onclick={Callback::from({let om = open_menu.clone(); move |_: MouseEvent| om.set(None)})} />
             }
 
             <div class="flex flex-1 min-h-0 relative">
@@ -1243,11 +1438,20 @@ fn chat_room(props: &ChatRoomProps) -> Html {
 
                     <div class="p-2 border-b border-[#808080] flex gap-1">
                         <button class="aim-btn flex-1 px-1"
-                            onclick={Callback::from({let s = show_host_modal.clone(); move |_: MouseEvent| s.set(true)})}>
+                            onclick={Callback::from({
+                                let s = show_host_modal.clone();
+                                let rn = room_name_input.clone();
+                                move |_: MouseEvent| { rn.set("general".into()); s.set(true); }
+                            })}>
                             {"New Room"}
                         </button>
                         <button class="aim-btn flex-1 px-1"
-                            onclick={Callback::from({let s = show_join_modal.clone(); move |_: MouseEvent| s.set(true)})}>
+                            onclick={Callback::from({
+                                let s = show_join_modal.clone();
+                                let rn = room_name_input.clone();
+                                let clear = props.on_clear_error.clone();
+                                move |_: MouseEvent| { rn.set("general".into()); clear.emit(()); s.set(true); }
+                            })}>
                             {"Join Room"}
                         </button>
                     </div>
@@ -1291,7 +1495,7 @@ fn chat_room(props: &ChatRoomProps) -> Html {
                                                     </button>
                                                 </div>
                                                 if open_menu.as_deref() == Some(room.topic_id.as_str()) {
-                                                    <div class="aim-window absolute right-0 z-30 min-w-[140px]" style="top:100%">
+                                                    <div class="aim-window absolute right-0 min-w-[140px]" style="top:100%;z-index:30">
                                                         <button class="block w-full text-left aim-buddy text-[11px]"
                                                             onclick={Callback::from({
                                                                 let url = invite_url.clone();
@@ -1363,9 +1567,15 @@ fn chat_room(props: &ChatRoomProps) -> Html {
                                 } else {
                                     let is_me = msg.from_endpoint == props.endpoint_id;
                                     let sender_class = if is_me { "sender-me" } else { "sender-them" };
+                                    let display_name = if is_me {
+                                        msg.from_name.clone()
+                                    } else {
+                                        room.names.get(&msg.from_endpoint).cloned()
+                                            .unwrap_or_else(|| msg.from_name.clone())
+                                    };
                                     html! {
                                         <p>
-                                            <span class={sender_class}>{msg.from_name.clone()}{": "}</span>
+                                            <span class={sender_class}>{display_name}{": "}</span>
                                             {msg.text.clone()}
                                         </p>
                                     }
@@ -1434,60 +1644,32 @@ async fn init_node(key_bytes: [u8; 32]) -> std::result::Result<NodeHandle, JsVal
 async fn gossip_event_loop(
     gossip: BrowserProtocolHandle<ChatGossipProtocol>,
     local_ep: String,
-    state: UseStateHandle<AppState>,
+    state: UseReducerHandle<AppState>,
 ) {
     loop {
         let Ok(Some(event)) = gossip.next_event().await else { break; };
-        let mut s = (*state).clone();
         match event {
-            ChatGossipEvent::Joined { topic } => {
-                if let Some(r) = s.rooms.iter_mut().find(|r| r.topic_id == topic) {
-                    r.joined = true;
-                }
-            }
+            ChatGossipEvent::Joined { topic } => state.dispatch(Action::Joined(topic)),
             ChatGossipEvent::NeighborUp { topic, endpoint } => {
-                if let Some(r) = s.rooms.iter_mut().find(|r| r.topic_id == topic) {
-                    if !r.participants.contains(&endpoint) {
-                        r.participants.push(endpoint.clone());
-                    }
-                }
+                state.dispatch(Action::NeighborUp { topic, endpoint })
             }
             ChatGossipEvent::NeighborDown { topic, endpoint } => {
-                if let Some(r) = s.rooms.iter_mut().find(|r| r.topic_id == topic) {
-                    r.participants.retain(|p| p != &endpoint);
-                    let display = r.names.get(&endpoint).cloned()
-                        .unwrap_or_else(|| {
-                            let short: String = endpoint.chars().take(12).collect();
-                            format!("{short}…")
-                        });
-                    r.messages.push(sys_msg(&format!("*** {display} left")));
-                }
+                state.dispatch(Action::NeighborDown { topic, endpoint })
             }
             ChatGossipEvent::Chat { topic, from_endpoint, from_name, text } => {
                 if from_endpoint != local_ep {
-                    if let Some(r) = s.rooms.iter_mut().find(|r| r.topic_id == topic) {
-                        r.names.insert(from_endpoint.clone(), from_name.clone());
-                        r.messages.push(ChatMsg { from_endpoint, from_name, text, is_system: false });
-                    }
+                    state.dispatch(Action::RecvChat { topic, from_endpoint, from_name, text });
                 }
             }
             ChatGossipEvent::System { topic, text } => {
-                if let Some(r) = s.rooms.iter_mut().find(|r| r.topic_id == topic) {
-                    r.messages.push(sys_msg(&text));
-                }
+                state.dispatch(Action::System { topic, text })
             }
             ChatGossipEvent::Identify { topic, endpoint, name } => {
-                if endpoint == local_ep { state.set(s); continue; }
-                if let Some(r) = s.rooms.iter_mut().find(|r| r.topic_id == topic) {
-                    let was_new = !r.names.contains_key(&endpoint);
-                    r.names.insert(endpoint, name.clone());
-                    if was_new {
-                        r.messages.push(sys_msg(&format!("*** {name} joined")));
-                    }
+                if endpoint != local_ep {
+                    state.dispatch(Action::Identify { topic, endpoint, name });
                 }
             }
         }
-        state.set(s);
     }
 }
 
@@ -1497,19 +1679,12 @@ async fn do_host(
     topic_b64: String,
     room_name: String,
     name: String,
-    state: UseStateHandle<AppState>,
+    state: UseReducerHandle<AppState>,
 ) {
-    let topic_bytes: [u8; 32] = BASE64.decode(&topic_b64)
-        .ok()
-        .and_then(|b| b.try_into().ok())
-        .unwrap_or([0u8; 32]);
+    let Some(topic_bytes) = decode_topic_b64(&topic_b64) else { return };
     let topic_id = TopicId::from_bytes(topic_bytes).to_string();
-    let mut s = (*state).clone();
-    if s.rooms.iter().any(|r| r.topic_id == topic_id) {
-        return;
-    }
-    s.local_name = name.clone();
-    s.rooms.push(RoomState {
+
+    state.dispatch(Action::AddRoom(RoomState {
         topic_id: topic_id.clone(),
         topic_bytes,
         name: room_name.clone(),
@@ -1519,9 +1694,7 @@ async fn do_host(
         joined: false,
         names: HashMap::new(),
         bootstrap_peers: vec![],
-    });
-    s.active_topic = Some(topic_id.clone());
-    state.set(s);
+    }));
 
     let _ = gossip
         .send(ChatGossipCommand::Join { topic: topic_id, peers: vec![], endpoint, name })
@@ -1534,28 +1707,16 @@ async fn do_join(
     invite: String,
     room_name: String,
     name: String,
-    state: UseStateHandle<AppState>,
-) {
-    let invite = invite.find('#').map_or(invite.as_str(), |i| &invite[i + 1..]).to_string();
-    let (topic_bytes, host) = if let Some(idx) = invite.find('|') {
-        let topic_b64 = &invite[..idx];
-        let host_ep = invite[idx + 1..].to_string();
-        let bytes = BASE64.decode(topic_b64)
-            .ok()
-            .and_then(|b| b.try_into().ok())
-            .unwrap_or([0u8; 32]);
-        (bytes, host_ep)
-    } else {
-        ([0u8; 32], invite)
-    };
+    state: UseReducerHandle<AppState>,
+) -> std::result::Result<(), String> {
+    let (topic_bytes, host) = parse_invite(&invite)
+        .ok_or_else(|| String::from("Invalid invite link"))?;
+    if host == endpoint {
+        return Err("That's your own invite link.".into());
+    }
     let topic_id = TopicId::from_bytes(topic_bytes).to_string();
 
-    let mut s = (*state).clone();
-    if s.rooms.iter().any(|r| r.topic_id == topic_id) {
-        return;
-    }
-    s.local_name = name.clone();
-    s.rooms.push(RoomState {
+    state.dispatch(Action::AddRoom(RoomState {
         topic_id: topic_id.clone(),
         topic_bytes,
         name: room_name.clone(),
@@ -1565,35 +1726,33 @@ async fn do_join(
         joined: false,
         names: HashMap::new(),
         bootstrap_peers: vec![host.clone()],
-    });
-    s.active_topic = Some(topic_id.clone());
-    state.set(s);
+    }));
 
     let _ = gossip
         .send(ChatGossipCommand::Join { topic: topic_id, peers: vec![host], endpoint, name })
         .await;
+    Ok(())
 }
 
 async fn do_send(
     gossip: BrowserProtocolHandle<ChatGossipProtocol>,
     endpoint: String,
-    name: String,
-    text: String,
+    mut name: String,
+    mut text: String,
     topic_id: String,
-    state: UseStateHandle<AppState>,
+    state: UseReducerHandle<AppState>,
 ) {
-    let mut s = (*state).clone();
-    if let Some(r) = s.rooms.iter_mut().find(|r| r.topic_id == topic_id) {
-        r.messages.push(ChatMsg {
+    truncate_chars(&mut name, MAX_NAME_CHARS);
+    truncate_chars(&mut text, MAX_TEXT_CHARS);
+    state.dispatch(Action::LocalSend {
+        topic: topic_id.clone(),
+        msg: ChatMsg {
             from_endpoint: endpoint.clone(),
             from_name: name.clone(),
             text: text.clone(),
             is_system: false,
-        });
-    } else {
-        return;
-    }
-    state.set(s);
+        },
+    });
     let _ = gossip
         .send(ChatGossipCommand::Send { topic: topic_id, from_endpoint: endpoint, from_name: name, text })
         .await;
