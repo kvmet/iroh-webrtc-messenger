@@ -34,6 +34,9 @@ jobs:
             examples/rust-browser-chat-room/target
           key: cargo-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
 
+      - name: Install LLVM
+        run: sudo apt-get install -y clang llvm
+
       - name: Install Trunk
         run: cargo install trunk --locked
 
