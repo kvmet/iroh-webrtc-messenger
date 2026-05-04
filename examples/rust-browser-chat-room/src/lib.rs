@@ -22,6 +22,7 @@ use iroh_webrtc_transport::{
     },
 };
 use js_sys::{Array, Object, Reflect, Uint8Array};
+use qrcode::{QrCode, render::svg};
 use n0_future::{StreamExt, task};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex as AsyncMutex, mpsc};
@@ -262,6 +263,14 @@ fn make_invite_url(topic_bytes: [u8; 32], endpoint_id: &str) -> Option<String> {
     let origin = loc.origin().ok()?;
     let path = loc.pathname().ok()?;
     Some(format!("{}{}#{}|{}", origin, path, BASE64.encode(topic_bytes), endpoint_id))
+}
+
+fn make_qr_svg(text: &str) -> Option<String> {
+    let code = QrCode::new(text.as_bytes()).ok()?;
+    Some(code.render::<svg::Color>()
+        .min_dimensions(240, 240)
+        .quiet_zone(true)
+        .build())
 }
 
 fn copy_to_clipboard(text: &str) {
@@ -943,6 +952,8 @@ fn chat_room(props: &ChatRoomProps) -> Html {
     let show_host_modal = use_state(|| false);
     let show_join_modal = use_state(|| false);
     let open_menu: UseStateHandle<Option<String>> = use_state(|| None);
+    let qr_url: UseStateHandle<Option<String>> = use_state(|| None);
+    let sidebar_open = use_state(|| false);
 
     // Auto-open join modal when arriving via invite link
     use_effect_with((), {
@@ -1079,13 +1090,40 @@ fn chat_room(props: &ChatRoomProps) -> Html {
     html! {
         <div class="aim-window flex flex-col h-full">
             <div class="aim-titlebar">
+                <button class="md:hidden aim-btn px-1 py-0 text-xs mr-1"
+                    onclick={Callback::from({let s = sidebar_open.clone(); move |_: MouseEvent| s.set(!*s)})}>
+                    {"☰"}
+                </button>
                 {"🔵 Iroh Messenger"}
-                <span class="ml-auto font-normal opacity-75 text-[10px]">
-                    { active_room.map_or_else(|| "WebRTC P2P".into(), |r| format!("#{} · WebRTC P2P", r.name)) }
+                <span class="ml-auto font-normal opacity-75 text-[10px] truncate">
+                    { active_room.map_or_else(|| "WebRTC P2P".into(), |r| format!("#{}", r.name)) }
                 </span>
             </div>
 
             // ── Modals ────────────────────────────────────────────────────────
+            if let Some(url) = (*qr_url).clone() {
+                <div class="fixed inset-0 flex items-center justify-center" style="z-index:50">
+                    <div class="absolute inset-0 bg-black opacity-30"
+                        onclick={Callback::from({let s = qr_url.clone(); move |_: MouseEvent| s.set(None)})} />
+                    <div class="aim-window relative max-w-[90vw]">
+                        <div class="aim-titlebar">
+                            {"Invite QR Code"}
+                            <button class="ml-auto aim-btn px-1 py-0 text-xs"
+                                onclick={Callback::from({let s = qr_url.clone(); move |_: MouseEvent| s.set(None)})}>
+                                {"x"}
+                            </button>
+                        </div>
+                        <div class="p-3 flex flex-col items-center">
+                            <div class="bg-white p-2">
+                                { make_qr_svg(&url).map(|svg| Html::from_html_unchecked(svg.into()))
+                                    .unwrap_or(html!{<p class="text-xs">{"QR generation failed"}</p>}) }
+                            </div>
+                            <div class="text-[10px] font-mono mt-2 break-all max-w-[240px] text-center">{url}</div>
+                        </div>
+                    </div>
+                </div>
+            }
+
             if *show_host_modal {
                 <div class="fixed inset-0 flex items-center justify-center" style="z-index:50">
                     <div class="absolute inset-0 bg-black opacity-30"
@@ -1151,9 +1189,20 @@ fn chat_room(props: &ChatRoomProps) -> Html {
                 </div>
             }
 
-            <div class="flex flex-1 min-h-0">
+            <div class="flex flex-1 min-h-0 relative">
+                // Mobile drawer backdrop
+                if *sidebar_open {
+                    <div class="md:hidden absolute inset-0 bg-black opacity-30 z-10"
+                        onclick={Callback::from({let s = sidebar_open.clone(); move |_: MouseEvent| s.set(false)})} />
+                }
                 // ── Left sidebar ──────────────────────────────────────────────
-                <div class="w-52 shrink-0 border-r-2 border-r-[#808080] flex flex-col overflow-hidden">
+                <div class={classes!(
+                    "w-52", "shrink-0", "border-r-2", "border-r-[#808080]",
+                    "flex-col", "overflow-hidden", "bg-[#c0c0c0]",
+                    "absolute", "md:relative", "inset-y-0", "left-0", "z-20",
+                    if *sidebar_open { "flex" } else { "hidden" },
+                    "md:!flex"
+                )}>
 
                     if !props.persistent {
                         <div class="p-1 px-2 bg-[#ffff80] border-b border-[#808080] text-[10px] leading-tight">
@@ -1187,6 +1236,7 @@ fn chat_room(props: &ChatRoomProps) -> Html {
                                         let is_active = props.state.active_topic.as_deref() == Some(room.topic_id.as_str());
                                         let tid = room.topic_id.clone();
                                         let switch_cb = props.on_switch_room.clone();
+                                        let sidebar_close = sidebar_open.clone();
                                         let menu_tid = tid.clone();
                                         let open_menu_h = open_menu.clone();
                                         let is_menu_open = open_menu.as_deref() == Some(room.topic_id.as_str());
@@ -1196,7 +1246,10 @@ fn chat_room(props: &ChatRoomProps) -> Html {
                                             <li class="relative">
                                                 <div class={if is_active { "flex items-center bg-[#000080] text-white" } else { "flex items-center" }}>
                                                     <span class="flex-1 aim-buddy truncate"
-                                                        onclick={Callback::from(move |_: MouseEvent| switch_cb.emit(tid.clone()))}>
+                                                        onclick={Callback::from(move |_: MouseEvent| {
+                                                            switch_cb.emit(tid.clone());
+                                                            sidebar_close.set(false);
+                                                        })}>
                                                         {format!("#{}", room.name)}
                                                         if room.participants.len() > 0 {
                                                             <span class="ml-1 opacity-70 text-[10px]">
@@ -1213,7 +1266,7 @@ fn chat_room(props: &ChatRoomProps) -> Html {
                                                     </button>
                                                 </div>
                                                 if open_menu.as_deref() == Some(room.topic_id.as_str()) {
-                                                    <div class="aim-window absolute right-0 z-10 min-w-[140px]" style="top:100%">
+                                                    <div class="aim-window absolute right-0 z-30 min-w-[140px]" style="top:100%">
                                                         <button class="block w-full text-left aim-buddy text-[11px]"
                                                             onclick={Callback::from({
                                                                 let url = invite_url.clone();
@@ -1221,6 +1274,15 @@ fn chat_room(props: &ChatRoomProps) -> Html {
                                                                 move |_: MouseEvent| { copy_to_clipboard(&url); om.set(None); }
                                                             })}>
                                                             {"Copy invite link"}
+                                                        </button>
+                                                        <button class="block w-full text-left aim-buddy text-[11px]"
+                                                            onclick={Callback::from({
+                                                                let url = invite_url.clone();
+                                                                let om = open_menu.clone();
+                                                                let qr = qr_url.clone();
+                                                                move |_: MouseEvent| { qr.set(Some(url.clone())); om.set(None); }
+                                                            })}>
+                                                            {"Show QR code"}
                                                         </button>
                                                     </div>
                                                 }
