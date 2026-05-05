@@ -2,7 +2,7 @@ use iroh::SecretKey;
 use web_sys::{HtmlInputElement, HtmlTextAreaElement};
 use yew::prelude::*;
 
-use crate::storage::{import_backup, save_name, stored_name};
+use crate::storage::{import_backup, stored_name};
 
 fn reload_page() {
     if let Some(window) = web_sys::window() {
@@ -182,7 +182,7 @@ pub(crate) fn passphrase_gate(props: &PassphraseGateProps) -> Html {
 
 #[derive(Properties, PartialEq)]
 pub(crate) struct NewUserSetupProps {
-    pub(crate) on_ready: Callback<([u8; 32], Option<String>)>,
+    pub(crate) on_ready: Callback<([u8; 32], Option<String>, String)>,
 }
 
 #[function_component(NewUserSetup)]
@@ -210,10 +210,9 @@ pub(crate) fn new_user_setup(props: &NewUserSetupProps) -> Html {
         let cb = props.on_ready.clone();
         std::rc::Rc::new(move || {
             let n = (*name).clone();
-            save_name(&n);
             let key_bytes = SecretKey::generate().to_bytes();
             let p = if (*pass).is_empty() { None } else { Some((*pass).clone()) };
-            cb.emit((key_bytes, p));
+            cb.emit((key_bytes, p, n));
         })
     };
     let on_go = {

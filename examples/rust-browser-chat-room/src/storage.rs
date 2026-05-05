@@ -42,17 +42,14 @@ pub(crate) fn forget_stored() {
     }
 }
 
+/// Best-effort default screen name. Reads any pre-existing plaintext
+/// `iroh.name` value (older builds wrote it) so upgrading users don't
+/// lose their name; current code never writes it. Falls back to "AIM User".
 pub(crate) fn stored_name() -> String {
     local_storage()
         .ok()
         .and_then(|s| s.get_item(STORAGE_NAME).ok().flatten())
         .unwrap_or_else(|| "AIM User".to_string())
-}
-
-pub(crate) fn save_name(name: &str) {
-    if let Ok(s) = local_storage() {
-        let _ = s.set_item(STORAGE_NAME, name);
-    }
 }
 
 /// Bump when we restructure the [`Profile`] schema in a way that

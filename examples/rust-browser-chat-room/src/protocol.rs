@@ -198,16 +198,29 @@ impl BrowserProtocol for ChatGossipProtocol {
                 if let Some(existing_sender) = already {
                     let _ = self.events_tx.send(ChatGossipEvent::Joined { topic: topic.clone() });
                     let sig = sign_about_me(&secret_key, &topic_bytes, &endpoint, &name);
+                    let events = self.events_tx.clone();
+                    let topic_for_err = topic.clone();
                     // spawn_local: encrypt_data uses JsFuture (!Send), can't be awaited
                     // directly in handle_command which must return a Send future.
                     wasm_bindgen_futures::spawn_local(async move {
-                        let _ = broadcast_encrypted(
+                        if let Err(e) = broadcast_encrypted(
                             &existing_sender,
                             ChatWireMessage::AboutMe { endpoint, name, sig },
                             &topic_bytes,
                         )
-                        .await;
-                        let _ = broadcast_encrypted(&existing_sender, ChatWireMessage::Sync, &topic_bytes).await;
+                        .await
+                        {
+                            let _ = events.send(ChatGossipEvent::System {
+                                topic: topic_for_err.clone(),
+                                text: format!("rejoin announce failed: {e}"),
+                            });
+                        }
+                        if let Err(e) = broadcast_encrypted(&existing_sender, ChatWireMessage::Sync, &topic_bytes).await {
+                            let _ = events.send(ChatGossipEvent::System {
+                                topic: topic_for_err,
+                                text: format!("rejoin sync failed: {e}"),
+                            });
+                        }
                     });
                     return Ok(());
                 }
@@ -347,11 +360,23 @@ impl BrowserProtocol for ChatGossipProtocol {
                 });
                 let _ = self.events_tx.send(ChatGossipEvent::Joined { topic: topic.clone() });
                 let sig = sign_about_me(&secret_key, &topic_bytes, &endpoint, &name);
+                let events = self.events_tx.clone();
+                let topic_for_err = topic.clone();
                 wasm_bindgen_futures::spawn_local(async move {
-                    let _ = broadcast_encrypted(&sender, ChatWireMessage::AboutMe { endpoint, name, sig }, &topic_bytes).await;
+                    if let Err(e) = broadcast_encrypted(&sender, ChatWireMessage::AboutMe { endpoint, name, sig }, &topic_bytes).await {
+                        let _ = events.send(ChatGossipEvent::System {
+                            topic: topic_for_err.clone(),
+                            text: format!("initial announce failed: {e}"),
+                        });
+                    }
                     // Ask everyone in the topic to re-announce themselves so we
                     // populate our name map without periodic keepalive traffic.
-                    let _ = broadcast_encrypted(&sender, ChatWireMessage::Sync, &topic_bytes).await;
+                    if let Err(e) = broadcast_encrypted(&sender, ChatWireMessage::Sync, &topic_bytes).await {
+                        let _ = events.send(ChatGossipEvent::System {
+                            topic: topic_for_err,
+                            text: format!("initial sync failed: {e}"),
+                        });
+                    }
                 });
             }
             ChatGossipCommand::Send { topic, from_endpoint, from_name, text } => {
@@ -371,13 +396,21 @@ impl BrowserProtocol for ChatGossipProtocol {
                     (sender, topic_bytes, secret_key)
                 };
                 let sig = sign_chat(&secret_key, &topic_bytes, &from_endpoint, &text);
+                let events = self.events_tx.clone();
+                let topic_for_err = topic.clone();
                 wasm_bindgen_futures::spawn_local(async move {
-                    let _ = broadcast_encrypted(
+                    if let Err(e) = broadcast_encrypted(
                         &sender,
                         ChatWireMessage::Chat { from_endpoint, from_name, text, sig },
                         &topic_bytes,
                     )
-                    .await;
+                    .await
+                    {
+                        let _ = events.send(ChatGossipEvent::System {
+                            topic: topic_for_err,
+                            text: format!("delivery failed: {e}"),
+                        });
+                    }
                 });
             }
         }

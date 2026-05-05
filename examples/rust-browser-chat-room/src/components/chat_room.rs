@@ -6,7 +6,7 @@ use web_sys::{HtmlElement, HtmlInputElement, HtmlTextAreaElement};
 use yew::prelude::*;
 
 use crate::state::{AppState, RoomMode};
-use crate::storage::{export_backup, save_name, save_profile};
+use crate::storage::{export_backup, save_profile};
 use crate::util::{copy_to_clipboard, download_text, endpoint_icon_svg, make_invite_url, make_qr_svg, parse_invite};
 
 #[derive(Properties, PartialEq)]
@@ -114,15 +114,11 @@ pub(crate) fn chat_room(props: &ChatRoomProps) -> Html {
 
     let on_name_input = {
         let name = name.clone();
-        let persistent = props.persistent;
-        let ephemeral = props.ephemeral;
         Callback::from(move |e: InputEvent| {
             let el: HtmlInputElement = e.target_unchecked_into();
-            let v = el.value();
-            // Plaintext name save only for unauthenticated (non-ephemeral) sessions;
-            // encrypted save happens via the profile effect when persistent.
-            if !persistent && !ephemeral { save_name(&v); }
-            name.set(v);
+            // Persistent sessions save via the encrypted profile effect.
+            // Non-persistent sessions never persist the screen name.
+            name.set(el.value());
         })
     };
     let on_host_input = {
@@ -657,7 +653,7 @@ fn identity_icon(endpoint: &str, display_name: &str) -> Html {
         endpoint.to_string()
     };
     let tooltip = format!(
-        "{display_name}\nID: {short_id}\n✓ Ed25519 signed\n✓ AES-256-GCM encrypted"
+        "{display_name}\nID: {short_id}\nSigned by this peer (Ed25519)\nEncrypted with the room's shared key (AES-256-GCM)\nNote: anyone with the room invite can read messages."
     );
     html! {
         <span

@@ -32,6 +32,9 @@ pub(crate) fn app() -> Html {
     let identity_key = use_state(|| [0u8; 32]);
     let passphrase_error: UseStateHandle<Option<String>> = use_state(|| None);
     let ephemeral = use_state(|| false);
+    // Name typed during NewUserSetup, kept only in memory until the chat room
+    // mounts. We never persist plaintext names to localStorage.
+    let pending_name: UseStateHandle<Option<String>> = use_state(|| None);
 
     // Check localStorage on mount
     {
@@ -54,6 +57,7 @@ pub(crate) fn app() -> Html {
         let chat_state = chat_state.clone();
         let identity_key = identity_key.clone();
         let ephemeral_eff = ephemeral.clone();
+        let pending_name_eff = pending_name.clone();
         use_effect_with(phase_val, move |p| {
             if let AppPhase::SpawningNode(key_bytes) = p {
                 let key_bytes = *key_bytes;
@@ -62,6 +66,7 @@ pub(crate) fn app() -> Html {
                 let chat_state = chat_state.clone();
                 let identity_key = identity_key.clone();
                 let is_ephemeral = *ephemeral_eff;
+                let pending = (*pending_name_eff).clone();
                 spawn_local(async move {
                     identity_key.set(key_bytes);
                     let profile = if is_ephemeral { Profile::default() } else { load_profile(&key_bytes).await };
@@ -70,7 +75,10 @@ pub(crate) fn app() -> Html {
                             let gossip = handle.gossip.clone();
                             let ep = handle.endpoint_id.clone();
                             let (profile_name, restored) = profile.into_rooms();
-                            let local_name = if profile_name.is_empty() { stored_name() } else { profile_name };
+                            // Precedence: pending typed name > encrypted profile > stored fallback.
+                            let local_name = pending
+                                .filter(|s| !s.is_empty())
+                                .unwrap_or_else(|| if profile_name.is_empty() { stored_name() } else { profile_name });
                             *node_ref.borrow_mut() = Some(handle);
                             let mut initial = AppState::default();
                             initial.active_topic = restored.first().map(|r| r.topic_id.clone());
@@ -158,8 +166,10 @@ pub(crate) fn app() -> Html {
         AppPhase::NewUser => {
             let on_ready = {
                 let phase = phase.clone();
-                Callback::from(move |(kb, pass): ([u8; 32], Option<String>)| {
+                let pending_name = pending_name.clone();
+                Callback::from(move |(kb, pass, name): ([u8; 32], Option<String>, String)| {
                     let phase = phase.clone();
+                    let pending_name = pending_name.clone();
                     spawn_local(async move {
                         if let Some(p) = pass {
                             if !p.is_empty() {
@@ -168,6 +178,7 @@ pub(crate) fn app() -> Html {
                                 }
                             }
                         }
+                        pending_name.set(if name.is_empty() { None } else { Some(name) });
                         phase.set(AppPhase::SpawningNode(kb));
                     });
                 })
