@@ -1,7 +1,23 @@
+//! Web Crypto wrappers for identity and profile encryption.
+//!
+//! ## Forward-compatibility contract
+//!
+//! Every encrypted blob produced by this module starts with a **1-byte
+//! version**. `decrypt_key` / `decrypt_data` dispatch on that byte. To
+//! evolve crypto parameters (KDF iterations, cipher, IV size, ...) bump
+//! [`ENC_VERSION_CURRENT`] and add a new branch in the decrypt match.
+//! Never reuse a version number.
+//!
+//! Version 1: PBKDF2-HMAC-SHA256, 600_000 iter, 16-byte salt, 12-byte IV,
+//!            AES-256-GCM. Plaintext layout is whatever the caller uses.
+
 use js_sys::{Array, Object, Reflect, Uint8Array};
 use wasm_bindgen::{JsCast, prelude::*};
 use wasm_bindgen_futures::JsFuture;
 use web_sys::TextEncoder;
+
+/// Bump when changing KDF or cipher params. Add a new arm in decrypt.
+const ENC_VERSION_CURRENT: u8 = 1;
 
 async fn aes_key(
     passphrase: &str,
@@ -74,7 +90,8 @@ pub(crate) async fn encrypt_key(
     )?)
     .await?;
 
-    let mut encrypted = iv;
+    let mut encrypted = vec![ENC_VERSION_CURRENT];
+    encrypted.extend_from_slice(&iv);
     encrypted.extend_from_slice(&Uint8Array::new(&ct).to_vec());
     Ok((encrypted, salt))
 }
@@ -84,32 +101,35 @@ pub(crate) async fn decrypt_key(
     salt: &[u8],
     passphrase: &str,
 ) -> std::result::Result<[u8; 32], JsValue> {
-    if encrypted.len() < 13 {
+    // 1 (ver) + 12 (iv) + 16 (gcm tag) is the minimum sane length
+    if encrypted.len() < 29 {
         return Err(JsValue::from_str("ciphertext too short"));
     }
-    let iv = &encrypted[..12];
-    let ct = &encrypted[12..];
-
-    let cipher_key = aes_key(passphrase, salt, "decrypt").await?;
-    let params = Object::new();
-    Reflect::set(&params, &"name".into(), &"AES-GCM".into())?;
-    Reflect::set(&params, &"iv".into(), &Uint8Array::from(iv))?;
-
-    let subtle = web_sys::window()
-        .ok_or_else(|| JsValue::from_str("no window"))?
-        .crypto()?
-        .subtle();
-    let pt = JsFuture::from(subtle.decrypt_with_object_and_buffer_source(
-        &params,
-        &cipher_key,
-        &Uint8Array::from(ct),
-    )?)
-    .await?;
-
-    Uint8Array::new(&pt)
-        .to_vec()
-        .try_into()
-        .map_err(|_| JsValue::from_str("decrypted key has wrong length"))
+    match encrypted[0] {
+        1 => {
+            let iv = &encrypted[1..13];
+            let ct = &encrypted[13..];
+            let cipher_key = aes_key(passphrase, salt, "decrypt").await?;
+            let params = Object::new();
+            Reflect::set(&params, &"name".into(), &"AES-GCM".into())?;
+            Reflect::set(&params, &"iv".into(), &Uint8Array::from(iv))?;
+            let subtle = web_sys::window()
+                .ok_or_else(|| JsValue::from_str("no window"))?
+                .crypto()?
+                .subtle();
+            let pt = JsFuture::from(subtle.decrypt_with_object_and_buffer_source(
+                &params,
+                &cipher_key,
+                &Uint8Array::from(ct),
+            )?)
+            .await?;
+            Uint8Array::new(&pt)
+                .to_vec()
+                .try_into()
+                .map_err(|_| JsValue::from_str("decrypted key has wrong length"))
+        }
+        v => Err(JsValue::from_str(&format!("unknown encryption version: {v}"))),
+    }
 }
 
 async fn raw_aes_key(
@@ -154,7 +174,8 @@ pub(crate) async fn encrypt_data(
         &Uint8Array::from(data),
     )?)
     .await?;
-    let mut result = iv;
+    let mut result = vec![ENC_VERSION_CURRENT];
+    result.extend_from_slice(&iv);
     result.extend_from_slice(&Uint8Array::new(&ct).to_vec());
     Ok(result)
 }
@@ -163,24 +184,29 @@ pub(crate) async fn decrypt_data(
     encrypted: &[u8],
     key_bytes: &[u8; 32],
 ) -> std::result::Result<Vec<u8>, JsValue> {
-    if encrypted.len() < 13 {
+    if encrypted.len() < 29 {
         return Err(JsValue::from_str("ciphertext too short"));
     }
-    let iv = &encrypted[..12];
-    let ct = &encrypted[12..];
-    let cipher_key = raw_aes_key(key_bytes, "decrypt").await?;
-    let params = Object::new();
-    Reflect::set(&params, &"name".into(), &"AES-GCM".into())?;
-    Reflect::set(&params, &"iv".into(), &Uint8Array::from(iv))?;
-    let subtle = web_sys::window()
-        .ok_or_else(|| JsValue::from_str("no window"))?
-        .crypto()?
-        .subtle();
-    let pt = JsFuture::from(subtle.decrypt_with_object_and_buffer_source(
-        &params,
-        &cipher_key,
-        &Uint8Array::from(ct),
-    )?)
-    .await?;
-    Ok(Uint8Array::new(&pt).to_vec())
+    match encrypted[0] {
+        1 => {
+            let iv = &encrypted[1..13];
+            let ct = &encrypted[13..];
+            let cipher_key = raw_aes_key(key_bytes, "decrypt").await?;
+            let params = Object::new();
+            Reflect::set(&params, &"name".into(), &"AES-GCM".into())?;
+            Reflect::set(&params, &"iv".into(), &Uint8Array::from(iv))?;
+            let subtle = web_sys::window()
+                .ok_or_else(|| JsValue::from_str("no window"))?
+                .crypto()?
+                .subtle();
+            let pt = JsFuture::from(subtle.decrypt_with_object_and_buffer_source(
+                &params,
+                &cipher_key,
+                &Uint8Array::from(ct),
+            )?)
+            .await?;
+            Ok(Uint8Array::new(&pt).to_vec())
+        }
+        v => Err(JsValue::from_str(&format!("unknown encryption version: {v}"))),
+    }
 }

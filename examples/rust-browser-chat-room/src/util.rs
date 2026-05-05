@@ -41,9 +41,19 @@ fn url_decode(s: &str) -> String {
 /// Parsed invite: (topic_bytes, host_endpoint, optional proposed room name).
 /// Accepts either the bare `topic_b64|endpoint[|name]` payload or a full URL
 /// ending in that hash.
+///
+/// **Stability contract**: the format is positional pipe-separated. Adding
+/// a 4th positional field would silently break older parsers (the trailing
+/// segment would be appended to `name`). If a future version needs more
+/// fields, prefix the whole thing with a version tag (e.g. `v2:...`) so
+/// this parser fails cleanly on the topic decode and surfaces a clear
+/// "Invalid invite link" error instead of a quiet misparse.
+///
+/// Trailing segments beyond the third are explicitly ignored so that a
+/// future v1+ extension can append optional data without breaking us.
 pub(crate) fn parse_invite(invite: &str) -> Option<([u8; 32], String, Option<String>)> {
     let payload = invite.find('#').map_or(invite, |i| &invite[i + 1..]).trim();
-    let mut parts = payload.splitn(3, '|');
+    let mut parts = payload.split('|');
     let topic_b64 = parts.next()?;
     let host = parts.next()?.trim();
     if host.is_empty() {

@@ -51,11 +51,37 @@ pub(crate) enum ChatGossipEvent {
     Identify { topic: String, endpoint: String, name: String },
 }
 
+/// Over-the-wire message between peers.
+///
+/// **Stability contract** (read this before changing anything here):
+/// - Never remove or rename an existing variant or field.
+/// - New fields must be added with `#[serde(default)]` so older peers
+///   sending the old shape still deserialize.
+/// - New variants are safe to add — old peers receive them as
+///   [`ChatWireMessage::Unknown`] and silently no-op.
+/// - There is no version field by design. Forward compatibility is
+///   maintained by convention, not negotiation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
 enum ChatWireMessage {
-    AboutMe { endpoint: String, name: String },
-    Chat { from_endpoint: String, from_name: String, text: String },
+    AboutMe {
+        #[serde(default)]
+        endpoint: String,
+        #[serde(default)]
+        name: String,
+    },
+    Chat {
+        #[serde(default)]
+        from_endpoint: String,
+        #[serde(default)]
+        from_name: String,
+        #[serde(default)]
+        text: String,
+    },
+    /// Catch-all for variants this client doesn't know about.
+    /// Treated as a no-op by the receiver.
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Debug, Clone)]
@@ -161,6 +187,7 @@ impl BrowserProtocol for ChatGossipProtocol {
                                                 text,
                                             });
                                         }
+                                        ChatWireMessage::Unknown => {} // forward-compat no-op
                                     }
                                 }
                             }

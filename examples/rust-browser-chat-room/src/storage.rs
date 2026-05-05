@@ -55,21 +55,51 @@ pub(crate) fn save_name(name: &str) {
     }
 }
 
+/// Bump when we restructure the [`Profile`] schema in a way that
+/// can't be expressed by additive `#[serde(default)]` fields.
+const PROFILE_VERSION_CURRENT: u32 = 1;
+
+fn profile_version_default() -> u32 { 1 }
+
+/// One persisted room. **Stability contract**: never remove or rename a
+/// field. New fields must be added with `#[serde(default)]`.
 #[derive(Serialize, Deserialize)]
 struct RoomSave {
+    #[serde(default)]
     topic_b64: String,
+    #[serde(default)]
     name: String,
+    #[serde(default)]
     hosting: bool,
     #[serde(default)]
     bootstrap_peers: Vec<String>,
 }
 
-#[derive(Serialize, Deserialize, Default)]
+/// The full encrypted-at-rest user profile.
+///
+/// **Stability contract**:
+/// - Never remove or rename a field. Use `#[serde(default)]` for adds.
+/// - Bump [`PROFILE_VERSION_CURRENT`] only for restructuring changes
+///   that pure additive defaults can't handle.
+/// - Old data missing the version field deserializes as version 1.
+#[derive(Serialize, Deserialize)]
 pub(crate) struct Profile {
+    #[serde(default = "profile_version_default")]
+    version: u32,
     #[serde(default)]
     pub(crate) name: String,
     #[serde(default)]
     rooms: Vec<RoomSave>,
+}
+
+impl Default for Profile {
+    fn default() -> Self {
+        Self {
+            version: PROFILE_VERSION_CURRENT,
+            name: String::new(),
+            rooms: Vec::new(),
+        }
+    }
 }
 
 impl Profile {
@@ -104,7 +134,11 @@ pub(crate) async fn save_profile(name: &str, rooms: &[RoomState], key_bytes: &[u
         hosting: r.mode == RoomMode::Hosting,
         bootstrap_peers: r.bootstrap_peers.clone(),
     }).collect();
-    let profile = Profile { name: name.to_string(), rooms: saves };
+    let profile = Profile {
+        version: PROFILE_VERSION_CURRENT,
+        name: name.to_string(),
+        rooms: saves,
+    };
     let Ok(json) = serde_json::to_vec(&profile) else { return };
     let Ok(enc) = encrypt_data(&json, key_bytes).await else { return };
     if let Ok(s) = local_storage() {
