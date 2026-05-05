@@ -29,40 +29,41 @@ pub(crate) fn decode_topic_b64(s: &str) -> Option<[u8; 32]> {
     BASE64.decode(s).ok()?.try_into().ok()
 }
 
-fn url_encode(s: &str) -> String {
-    js_sys::encode_uri_component(s).as_string().unwrap_or_default()
-}
-
-fn url_decode(s: &str) -> String {
-    js_sys::decode_uri_component(s)
-        .ok()
-        .and_then(|j| j.as_string())
-        .unwrap_or_else(|| s.to_string())
-}
-
 /// Parsed invite: (room_secret, host_endpoint, optional proposed room name).
-/// Accepts either the bare `v2:<secret_b64>|<endpoint>[|<name>]` payload or
-/// a full URL ending in that hash.
+/// Accepts either the bare `v2:<secret_b64>.<endpoint>[.<name_b64>]`
+/// payload or a full URL ending in that hash.
 ///
-/// **Stability contract**: the format is `v2:` prefix + positional pipe-
+/// **Stability contract**: the format is `v2:` prefix + positional dot-
 /// separated. Trailing segments beyond the third are explicitly ignored so
 /// a future v2+ extension can append optional data without breaking us.
 /// Bumping the prefix (`v3:` etc.) is the path for breaking changes; this
 /// parser will return None on unknown prefixes, which surfaces a clear
 /// "Invalid invite link" error rather than a silent misparse.
 ///
-/// v1 invites (no prefix, raw `topic_b64|endpoint`) are not supported;
-/// they fail to parse and the user must request a new invite.
+/// All three fields are URL-safe-base64 (no padding) so the URL contains
+/// only `[A-Za-z0-9_-]` plus the `.` separator and the `v2:` prefix. This
+/// avoids two classes of problem the alternatives have:
+/// - `|` is technically reserved in URLs (RFC 3986); iOS Camera and most
+///   QR scanners refuse to recognize URLs containing raw pipes.
+/// - Percent-encoding the name leaves trailing punctuation (`!`, `)`, etc.)
+///   that messaging apps' URL auto-detectors often truncate.
+///
+/// v1 invites are not supported; they fail to parse and the user must
+/// request a new invite.
 pub(crate) fn parse_invite(invite: &str) -> Option<([u8; 32], String, Option<String>)> {
     let payload = invite.find('#').map_or(invite, |i| &invite[i + 1..]).trim();
     let payload = payload.strip_prefix("v2:")?;
-    let mut parts = payload.split('|');
+    let mut parts = payload.split('.');
     let secret_b64 = parts.next()?;
     let host = parts.next()?.trim();
     if host.is_empty() {
         return None;
     }
-    let name = parts.next().map(url_decode).filter(|s| !s.is_empty());
+    let name = parts
+        .next()
+        .and_then(|n| BASE64.decode(n).ok())
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+        .filter(|s| !s.is_empty());
     Some((decode_topic_b64(secret_b64)?, host.to_string(), name))
 }
 
@@ -77,9 +78,9 @@ pub(crate) fn make_invite_url(
     let name_part = if room_name.is_empty() {
         String::new()
     } else {
-        format!("|{}", url_encode(room_name))
+        format!(".{}", BASE64.encode(room_name.as_bytes()))
     };
-    Some(format!("{}{}#v2:{}|{}{}", origin, path, BASE64.encode(room_secret), endpoint_id, name_part))
+    Some(format!("{}{}#v2:{}.{}{}", origin, path, BASE64.encode(room_secret), endpoint_id, name_part))
 }
 
 pub(crate) fn make_qr_svg(text: &str) -> Option<String> {
