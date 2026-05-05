@@ -1,6 +1,8 @@
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD as BASE64};
+use iroh::PublicKey;
 use js_sys::{Array, Function, Promise, Reflect};
 use qrcode::{QrCode, render::svg};
+use std::str::FromStr;
 use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::{JsFuture, spawn_local};
 
@@ -103,6 +105,66 @@ pub(crate) fn download_text(filename: &str, content: &str) {
     let _ = el.set_attribute("download", filename);
     let a: web_sys::HtmlElement = el.unchecked_into();
     a.click();
+}
+
+/// Generates a small SVG identity icon for an endpoint using a bishop-walk
+/// ("drunken bishop") algorithm: the same technique OpenSSH uses for key art.
+/// The walk path produces a unique glyph; the hue and saturation come from
+/// the key bytes so each identity gets a consistent color family.
+///
+/// Safe to render via `Html::from_html_unchecked`: only integer coordinates
+/// and HSL values derived from `u8` arithmetic appear in the output.
+pub(crate) fn endpoint_icon_svg(endpoint: &str) -> String {
+    let bytes: [u8; 32] = PublicKey::from_str(endpoint)
+        .map(|pk| *pk.as_bytes())
+        .unwrap_or_else(|_| {
+            let mut h = [0u8; 32];
+            for (i, b) in endpoint.bytes().enumerate() {
+                h[i % 32] ^= b;
+            }
+            h
+        });
+
+    // Bishop walk on a 9×9 grid.
+    let mut field = [[0u8; 9]; 9];
+    let (mut cx, mut cy) = (4usize, 4usize);
+    for &byte in bytes.iter() {
+        for shift in [0u8, 2, 4, 6] {
+            let dx: isize = if (byte >> shift) & 1 == 0 { -1 } else { 1 };
+            let dy: isize = if (byte >> (shift + 1)) & 1 == 0 { -1 } else { 1 };
+            cx = (cx as isize + dx).clamp(0, 8) as usize;
+            cy = (cy as isize + dy).clamp(0, 8) as usize;
+            if field[cy][cx] < 14 {
+                field[cy][cx] += 1;
+            }
+        }
+    }
+
+    // Color from key bytes: hue spans full circle, saturation in 55–80%.
+    let hue = (bytes[0] as f32) * 360.0 / 256.0;
+    let sat = 55 + (bytes[1] % 26) as u32;
+
+    // viewBox 0 0 9 9, rendered at 18×18 px via width/height attributes.
+    let mut s = format!(
+        r#"<svg width="18" height="18" viewBox="0 0 9 9" xmlns="http://www.w3.org/2000/svg" style="display:block;image-rendering:pixelated">"#
+    );
+    s.push_str(&format!(
+        r#"<rect width="9" height="9" fill="hsl({hue:.0},{sat}%,92%)"/>"#
+    ));
+    for row in 0..9usize {
+        for col in 0..9usize {
+            let v = field[row][col];
+            if v > 0 {
+                // More visits → darker cell (lightness 75% down to 25%).
+                let l = 75u32.saturating_sub(v as u32 * 5);
+                s.push_str(&format!(
+                    r#"<rect x="{col}" y="{row}" width="1" height="1" fill="hsl({hue:.0},{sat}%,{l}%)"/>"#
+                ));
+            }
+        }
+    }
+    s.push_str("</svg>");
+    s
 }
 
 pub(crate) fn copy_to_clipboard(text: &str) {

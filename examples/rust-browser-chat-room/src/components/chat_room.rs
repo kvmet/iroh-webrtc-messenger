@@ -7,7 +7,7 @@ use yew::prelude::*;
 
 use crate::state::{AppState, RoomMode};
 use crate::storage::{export_backup, save_name, save_profile};
-use crate::util::{copy_to_clipboard, download_text, make_invite_url, make_qr_svg, parse_invite};
+use crate::util::{copy_to_clipboard, download_text, endpoint_icon_svg, make_invite_url, make_qr_svg, parse_invite};
 
 #[derive(Properties, PartialEq)]
 pub(crate) struct ChatRoomProps {
@@ -541,7 +541,8 @@ pub(crate) fn chat_room(props: &ChatRoomProps) -> Html {
                             <div>
                                 <div class="aim-section-label">{"Online"}</div>
                                 <ul>
-                                    <li class="aim-buddy font-bold text-[#000080]">
+                                    <li class="aim-buddy font-bold text-[#000080]" style="display:flex;align-items:center;gap:3px">
+                                        {identity_icon(&props.endpoint_id, &(*name))}
                                         {(*name).clone()}{" (me)"}
                                     </li>
                                     { for room.participants.iter().map(|ep| {
@@ -549,7 +550,14 @@ pub(crate) fn chat_room(props: &ChatRoomProps) -> Html {
                                             let short: String = ep.chars().take(20).collect();
                                             format!("{short}…")
                                         });
-                                        html! { <li class="aim-buddy">{display}</li> }
+                                        let ep = ep.clone();
+                                        let d = display.clone();
+                                        html! {
+                                            <li class="aim-buddy" style="display:flex;align-items:center;gap:3px">
+                                                {identity_icon(&ep, &d)}
+                                                {display}
+                                            </li>
+                                        }
                                     })}
                                 </ul>
                             </div>
@@ -588,8 +596,10 @@ pub(crate) fn chat_room(props: &ChatRoomProps) -> Html {
                                         room.names.get(&msg.from_endpoint).cloned()
                                             .unwrap_or_else(|| msg.from_name.clone())
                                     };
+                                    let icon = identity_icon(&msg.from_endpoint, &display_name);
                                     html! {
-                                        <p>
+                                        <p style="display:flex;align-items:baseline;gap:2px">
+                                            {icon}
                                             <span class={sender_class}>{display_name}{": "}</span>
                                             {msg.text.clone()}
                                         </p>
@@ -634,5 +644,27 @@ pub(crate) fn chat_room(props: &ChatRoomProps) -> Html {
                 </div>
             </div>
         </div>
+    }
+}
+
+/// Renders an 18×18 bishop-walk identity icon with a hover tooltip showing
+/// the endpoint ID and security properties of the session.
+fn identity_icon(endpoint: &str, display_name: &str) -> Html {
+    let svg = endpoint_icon_svg(endpoint);
+    let short_id = if endpoint.len() > 28 {
+        format!("{}…", &endpoint[..28])
+    } else {
+        endpoint.to_string()
+    };
+    let tooltip = format!(
+        "{display_name}\nID: {short_id}\n✓ Ed25519 signed\n✓ AES-256-GCM encrypted"
+    );
+    html! {
+        <span
+            title={tooltip}
+            style="display:inline-block;vertical-align:middle;margin-right:3px;border-radius:2px;overflow:hidden;cursor:default;flex-shrink:0"
+        >
+            { Html::from_html_unchecked(svg.into()) }
+        </span>
     }
 }
