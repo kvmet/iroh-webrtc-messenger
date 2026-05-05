@@ -41,6 +41,8 @@ yew = { version = "0.23.0", features = ["csr"] }
 base64 = "0.22.1"
 js-sys = "0.3"
 qrcode = { version = "0.14.1", default-features = false, features = ["svg"] }
+sha2 = { version = "0.11.0-rc.5", default-features = false }
+hkdf = "0.13.0"
 
 [profile.release]
 opt-level = "z"      # optimize for size (vs "3" = speed). Big wasm shrink.

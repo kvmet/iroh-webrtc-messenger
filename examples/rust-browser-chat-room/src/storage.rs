@@ -2,7 +2,7 @@ use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD as BASE64};
 use serde::{Deserialize, Serialize};
 use wasm_bindgen::JsValue;
 
-use crate::crypto::{decrypt_data, encrypt_data};
+use crate::crypto::{decrypt_data, derive_room_keys, encrypt_data};
 use crate::state::{RoomMode, RoomState};
 
 const STORAGE_ENC: &str = "iroh.id.enc";
@@ -44,26 +44,36 @@ pub(crate) fn forget_stored() {
 
 /// Best-effort default screen name. Reads any pre-existing plaintext
 /// `iroh.name` value (older builds wrote it) so upgrading users don't
-/// lose their name; current code never writes it. Falls back to "AIM User".
+/// lose their name; current code never writes it. Falls back to "Guest".
 pub(crate) fn stored_name() -> String {
     local_storage()
         .ok()
         .and_then(|s| s.get_item(STORAGE_NAME).ok().flatten())
-        .unwrap_or_else(|| "AIM User".to_string())
+        .unwrap_or_else(|| "Guest".to_string())
 }
 
 /// Bump when we restructure the [`Profile`] schema in a way that
 /// can't be expressed by additive `#[serde(default)]` fields.
-const PROFILE_VERSION_CURRENT: u32 = 1;
+///
+/// v1 → v2 (Phase C): the persisted per-room field changed from
+/// `topic_b64` (= raw 32-byte topic id, also doubling as the AES key)
+/// to `secret_b64` (a 32-byte room secret from which an HKDF derives
+/// both the topic id and the AES key). v1 entries are no longer
+/// readable; on upgrade, users must re-create or re-join their rooms.
+const PROFILE_VERSION_CURRENT: u32 = 2;
 
 fn profile_version_default() -> u32 { 1 }
 
 /// One persisted room. **Stability contract**: never remove or rename a
-/// field. New fields must be added with `#[serde(default)]`.
+/// field within the same schema version. New fields must be added with
+/// `#[serde(default)]`. To break the layout, bump
+/// [`PROFILE_VERSION_CURRENT`] and add a load-time version check.
 #[derive(Serialize, Deserialize)]
 struct RoomSave {
+    /// Base64 of the 32-byte room secret. HKDF derives the topic id and
+    /// AES key on load.
     #[serde(default)]
-    topic_b64: String,
+    secret_b64: String,
     #[serde(default)]
     name: String,
     #[serde(default)]
@@ -100,16 +110,22 @@ impl Default for Profile {
 }
 
 impl Profile {
-    /// Reconstruct `RoomState`s from the stored snapshot. Bad base64 entries
-    /// are dropped rather than promoted to the all-zero ghost topic.
+    /// Reconstruct `RoomState`s from the stored snapshot. Pre-v2 (`v1`)
+    /// profiles are silently dropped: their on-disk shape used the topic
+    /// id as the AES key, which doesn't survive the HKDF redesign. Bad
+    /// base64 entries are dropped rather than promoted to ghost rooms.
     pub(crate) fn into_rooms(self) -> (String, Vec<RoomState>) {
+        if self.version < 2 {
+            return (self.name, Vec::new());
+        }
         let rooms = self.rooms
             .into_iter()
             .filter_map(|s| {
-                let topic_bytes: [u8; 32] = BASE64.decode(&s.topic_b64).ok()?.try_into().ok()?;
+                let room_secret: [u8; 32] = BASE64.decode(&s.secret_b64).ok()?.try_into().ok()?;
+                let topic_id_bytes = derive_room_keys(&room_secret).topic_id;
                 Some(RoomState {
-                    topic_id: iroh_gossip::TopicId::from_bytes(topic_bytes).to_string(),
-                    topic_bytes,
+                    topic_id: iroh_gossip::TopicId::from_bytes(topic_id_bytes).to_string(),
+                    room_secret,
                     name: s.name,
                     mode: if s.hosting { RoomMode::Hosting } else { RoomMode::Joined },
                     messages: vec![],
@@ -117,6 +133,7 @@ impl Profile {
                     names: std::collections::HashMap::new(),
                     joined: false,
                     bootstrap_peers: s.bootstrap_peers,
+                    left_signers: std::collections::HashSet::new(),
                 })
             })
             .collect();
@@ -126,7 +143,7 @@ impl Profile {
 
 pub(crate) async fn save_profile(name: &str, rooms: &[RoomState], key_bytes: &[u8; 32]) {
     let saves: Vec<RoomSave> = rooms.iter().map(|r| RoomSave {
-        topic_b64: BASE64.encode(r.topic_bytes),
+        secret_b64: BASE64.encode(r.room_secret),
         name: r.name.clone(),
         hosting: r.mode == RoomMode::Hosting,
         bootstrap_peers: r.bootstrap_peers.clone(),

@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 use yew::prelude::*;
@@ -21,8 +21,12 @@ pub(crate) enum RoomMode {
 
 #[derive(Clone, PartialEq)]
 pub(crate) struct RoomState {
+    /// Stringified iroh-gossip TopicId (HKDF-derived from room_secret).
     pub(crate) topic_id: String,
-    pub(crate) topic_bytes: [u8; 32],
+    /// 32-byte room secret. The HKDF-derived topic_id (above) and AES key
+    /// are kept separate from this so anything logging topic_id cannot
+    /// leak the encryption key.
+    pub(crate) room_secret: [u8; 32],
     pub(crate) name: String,
     pub(crate) mode: RoomMode,
     pub(crate) messages: Vec<ChatMsg>,
@@ -30,6 +34,10 @@ pub(crate) struct RoomState {
     pub(crate) names: HashMap<String, String>,
     pub(crate) joined: bool,
     pub(crate) bootstrap_peers: Vec<String>,
+    /// Signers we've seen a verified Leave from. Used to suppress the
+    /// follow-up NeighborDown "disconnected" message for an intentional
+    /// departure. Cleared when the same signer rejoins.
+    pub(crate) left_signers: HashSet<String>,
 }
 
 #[derive(Clone, PartialEq, Default)]
@@ -53,6 +61,9 @@ pub(crate) enum Action {
     RecvChat { topic: String, from_endpoint: String, from_name: String, text: String },
     System { topic: String, text: String },
     Identify { topic: String, endpoint: String, name: String },
+    /// Verified signed Leave from a peer. Different from NeighborDown
+    /// (transport-level disconnect, which can be transient or induced).
+    PeerLeft { topic: String, endpoint: String },
     SetJoinError(Option<String>),
 }
 
@@ -100,16 +111,36 @@ impl Reducible for AppState {
                         r.participants.push(endpoint.clone());
                     }
                     add_known_peer(&mut r.bootstrap_peers, &endpoint);
+                    // A peer that previously signed Leave is now back. Clear
+                    // the suppression so a future disconnect renders again.
+                    r.left_signers.remove(&endpoint);
                 }
             }
             Action::NeighborDown { topic, endpoint } => {
+                if let Some(r) = s.rooms.iter_mut().find(|r| r.topic_id == topic) {
+                    r.participants.retain(|p| p != &endpoint);
+                    // If we already showed "X left" (from a verified Leave),
+                    // suppress the redundant transport-level "disconnected"
+                    // message for the same peer.
+                    if r.left_signers.contains(&endpoint) {
+                        return Rc::new(s);
+                    }
+                    let display = r.names.get(&endpoint).cloned().unwrap_or_else(|| {
+                        let short: String = endpoint.chars().take(12).collect();
+                        format!("{short}…")
+                    });
+                    r.messages.push(sys_msg(&format!("*** {display} disconnected")));
+                }
+            }
+            Action::PeerLeft { topic, endpoint } => {
                 if let Some(r) = s.rooms.iter_mut().find(|r| r.topic_id == topic) {
                     r.participants.retain(|p| p != &endpoint);
                     let display = r.names.get(&endpoint).cloned().unwrap_or_else(|| {
                         let short: String = endpoint.chars().take(12).collect();
                         format!("{short}…")
                     });
-                    r.messages.push(sys_msg(&format!("*** {display} left")));
+                    r.messages.push(sys_msg(&format!("*** {display} left the room")));
+                    r.left_signers.insert(endpoint);
                 }
             }
             Action::RecvChat { topic, from_endpoint, from_name, text } => {

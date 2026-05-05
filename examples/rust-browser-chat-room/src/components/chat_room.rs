@@ -5,6 +5,7 @@ use wasm_bindgen_futures::spawn_local;
 use web_sys::{HtmlElement, HtmlInputElement, HtmlTextAreaElement};
 use yew::prelude::*;
 
+use crate::crypto::derive_room_keys;
 use crate::state::{AppState, RoomMode};
 use crate::storage::{export_backup, save_profile};
 use crate::util::{copy_to_clipboard, download_text, endpoint_icon_svg, make_invite_url, make_qr_svg, parse_invite};
@@ -61,8 +62,9 @@ pub(crate) fn chat_room(props: &ChatRoomProps) -> Html {
         let switch = props.on_switch_room.clone();
         move |_| {
             if !(*host_input).is_empty() {
-                if let Some((topic_bytes, _host, name)) = parse_invite(&host_input) {
-                    let topic_id = TopicId::from_bytes(topic_bytes).to_string();
+                if let Some((room_secret, _host, name)) = parse_invite(&host_input) {
+                    let topic_id_bytes = derive_room_keys(&room_secret).topic_id;
+                    let topic_id = TopicId::from_bytes(topic_id_bytes).to_string();
                     if rooms.iter().any(|r| r.topic_id == topic_id) {
                         switch.emit(topic_id);
                     } else {
@@ -158,16 +160,19 @@ pub(crate) fn chat_room(props: &ChatRoomProps) -> Html {
         let show_host_modal = show_host_modal.clone();
         let cb = props.on_host.clone();
         std::rc::Rc::new(move || {
-            let mut topic_bytes = [0u8; 32];
+            // Generate a 32-byte room secret. The protocol HKDFs this into
+            // (topic_id, aes_key) on Join. The secret is what the invite
+            // carries; the topic id and AES key never leave the device.
+            let mut room_secret = [0u8; 32];
             if let Some(window) = web_sys::window() {
                 if let Ok(crypto) = window.crypto() {
                     let arr = Uint8Array::new_with_length(32);
                     let _ = crypto.get_random_values_with_array_buffer_view(&arr);
-                    arr.copy_to(&mut topic_bytes);
+                    arr.copy_to(&mut room_secret);
                 }
             }
-            let topic_b64 = BASE64.encode(topic_bytes);
-            cb.emit((topic_b64, (*room_name_input).clone(), (*name).clone()));
+            let secret_b64 = BASE64.encode(room_secret);
+            cb.emit((secret_b64, (*room_name_input).clone(), (*name).clone()));
             show_host_modal.set(false);
         })
     };
@@ -443,7 +448,7 @@ pub(crate) fn chat_room(props: &ChatRoomProps) -> Html {
                                         let menu_tid = tid.clone();
                                         let open_menu_h = open_menu.clone();
                                         let is_menu_open = open_menu.as_deref() == Some(room.topic_id.as_str());
-                                        let invite_url = make_invite_url(room.topic_bytes, &props.endpoint_id, &room.name)
+                                        let invite_url = make_invite_url(room.room_secret, &props.endpoint_id, &room.name)
                                             .unwrap_or_default();
                                         html! {
                                             <li class="relative">

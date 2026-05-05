@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use iroh::SecretKey;
 use iroh_gossip::TopicId;
@@ -9,6 +9,7 @@ use iroh_webrtc_transport::browser::{
 use wasm_bindgen::JsValue;
 use yew::prelude::*;
 
+use crate::crypto::derive_room_keys;
 use crate::protocol::{
     ChatGossipCommand, ChatGossipEvent, ChatGossipProtocol, MAX_NAME_CHARS, MAX_TEXT_CHARS,
 };
@@ -66,6 +67,11 @@ pub(crate) async fn gossip_event_loop(
                     state.dispatch(Action::Identify { topic, endpoint, name });
                 }
             }
+            ChatGossipEvent::PeerLeft { topic, endpoint } => {
+                if endpoint != local_ep {
+                    state.dispatch(Action::PeerLeft { topic, endpoint });
+                }
+            }
         }
     }
 }
@@ -73,17 +79,18 @@ pub(crate) async fn gossip_event_loop(
 pub(crate) async fn do_host(
     gossip: BrowserProtocolHandle<ChatGossipProtocol>,
     endpoint: String,
-    topic_b64: String,
+    secret_b64: String,
     room_name: String,
     name: String,
     state: UseReducerHandle<AppState>,
 ) {
-    let Some(topic_bytes) = decode_topic_b64(&topic_b64) else { return };
-    let topic_id = TopicId::from_bytes(topic_bytes).to_string();
+    let Some(room_secret) = decode_topic_b64(&secret_b64) else { return };
+    let room_keys = derive_room_keys(&room_secret);
+    let topic_id = TopicId::from_bytes(room_keys.topic_id).to_string();
 
     state.dispatch(Action::AddRoom(RoomState {
         topic_id: topic_id.clone(),
-        topic_bytes,
+        room_secret,
         name: room_name.clone(),
         mode: RoomMode::Hosting,
         messages: vec![sys_msg(&format!("*** Hosting #{room_name}. Share the invite link."))],
@@ -91,12 +98,13 @@ pub(crate) async fn do_host(
         joined: false,
         names: HashMap::new(),
         bootstrap_peers: vec![],
+        left_signers: HashSet::new(),
     }));
 
     let _ = gossip
         .send(ChatGossipCommand::Join {
             topic: topic_id,
-            topic_bytes,
+            room_secret,
             peers: vec![],
             endpoint,
             name,
@@ -112,16 +120,17 @@ pub(crate) async fn do_join(
     name: String,
     state: UseReducerHandle<AppState>,
 ) -> std::result::Result<(), String> {
-    let (topic_bytes, host, _proposed_name) = parse_invite(&invite)
+    let (room_secret, host, _proposed_name) = parse_invite(&invite)
         .ok_or_else(|| String::from("Invalid invite link"))?;
     if host == endpoint {
         return Err("That's your own invite link.".into());
     }
-    let topic_id = TopicId::from_bytes(topic_bytes).to_string();
+    let room_keys = derive_room_keys(&room_secret);
+    let topic_id = TopicId::from_bytes(room_keys.topic_id).to_string();
 
     state.dispatch(Action::AddRoom(RoomState {
         topic_id: topic_id.clone(),
-        topic_bytes,
+        room_secret,
         name: room_name.clone(),
         mode: RoomMode::Joined,
         messages: vec![sys_msg(&format!("*** Joining #{room_name}…"))],
@@ -129,12 +138,13 @@ pub(crate) async fn do_join(
         joined: false,
         names: HashMap::new(),
         bootstrap_peers: vec![host.clone()],
+        left_signers: HashSet::new(),
     }));
 
     let _ = gossip
         .send(ChatGossipCommand::Join {
             topic: topic_id,
-            topic_bytes,
+            room_secret,
             peers: vec![host],
             endpoint,
             name,

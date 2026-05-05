@@ -12,11 +12,73 @@
 //! Version 1: PBKDF2-HMAC-SHA256, 600_000 iter, 16-byte salt, 12-byte IV,
 //!            AES-256-GCM. Plaintext layout is whatever the caller uses.
 
+use hkdf::Hkdf;
 use iroh::{PublicKey, SecretKey, Signature};
 use js_sys::{Array, Object, Reflect, Uint8Array};
+use sha2::Sha256;
 use wasm_bindgen::{JsCast, prelude::*};
 use wasm_bindgen_futures::JsFuture;
 use web_sys::TextEncoder;
+
+/// Per-room derived keys. The AES key is secret (encryption); the topic_id
+/// is public (gossip routing) and is what the iroh-gossip TopicId is built
+/// from. Both are derived from a single 32-byte room secret via HKDF-SHA256
+/// with disjoint info strings, so a leak of the topic_id (e.g. via logs)
+/// does not compromise the AES key.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct RoomKeys {
+    pub(crate) topic_id: [u8; 32],
+    pub(crate) aes_key: [u8; 32],
+}
+
+const HKDF_INFO_TOPIC_ID: &[u8] = b"iroh-messenger/topic-id/v1";
+const HKDF_INFO_AES_KEY: &[u8] = b"iroh-messenger/aes-key/v1";
+
+/// Derive (topic_id, aes_key) from a 32-byte room secret via HKDF-SHA256.
+pub(crate) fn derive_room_keys(secret: &[u8; 32]) -> RoomKeys {
+    let h = Hkdf::<Sha256>::new(None, secret);
+    let mut topic_id = [0u8; 32];
+    let mut aes_key = [0u8; 32];
+    h.expand(HKDF_INFO_TOPIC_ID, &mut topic_id).expect("HKDF expand 32 bytes");
+    h.expand(HKDF_INFO_AES_KEY, &mut aes_key).expect("HKDF expand 32 bytes");
+    RoomKeys { topic_id, aes_key }
+}
+
+/// 16 random bytes from the browser's CSPRNG (window.crypto.getRandomValues).
+/// Used for per-message replay-protection nonces.
+pub(crate) fn random_nonce() -> [u8; 16] {
+    let crypto = web_sys::window()
+        .expect("no window")
+        .crypto()
+        .expect("no Crypto");
+    let arr = Uint8Array::new_with_length(16);
+    crypto
+        .get_random_values_with_array_buffer_view(&arr)
+        .expect("getRandomValues failed");
+    let mut out = [0u8; 16];
+    arr.copy_to(&mut out);
+    out
+}
+
+/// Returns the 32-byte raw Ed25519 public key for this secret key.
+/// Use this for signing payloads (the verifier reconstructs the same bytes
+/// from `signer.parse::<PublicKey>().as_bytes()`), so a sig binds to the
+/// canonical pubkey rather than to a self-claimed string.
+pub(crate) fn public_key_bytes(secret_key_bytes: &[u8; 32]) -> [u8; 32] {
+    *SecretKey::from_bytes(secret_key_bytes).public().as_bytes()
+}
+
+/// String form of the local signing identity, suitable for use as the
+/// `signer` field on wire messages and round-trip-parseable as a PublicKey.
+pub(crate) fn public_key_string(secret_key_bytes: &[u8; 32]) -> String {
+    SecretKey::from_bytes(secret_key_bytes).public().to_string()
+}
+
+/// Parse a signer string into the raw 32-byte pubkey. Returns None on
+/// malformed input.
+pub(crate) fn signer_pk_bytes(signer: &str) -> Option<[u8; 32]> {
+    signer.parse::<PublicKey>().ok().map(|pk| *pk.as_bytes())
+}
 
 /// Bump when changing KDF or cipher params. Add a new arm in decrypt.
 const ENC_VERSION_CURRENT: u8 = 1;

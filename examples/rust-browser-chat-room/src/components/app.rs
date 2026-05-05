@@ -2,6 +2,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use iroh::SecretKey;
+use wasm_bindgen::{JsCast, closure::Closure};
 use wasm_bindgen_futures::spawn_local;
 use yew::prelude::*;
 
@@ -35,6 +36,10 @@ pub(crate) fn app() -> Html {
     // Name typed during NewUserSetup, kept only in memory until the chat room
     // mounts. We never persist plaintext names to localStorage.
     let pending_name: UseStateHandle<Option<String>> = use_state(|| None);
+    // Live snapshot of currently-joined topic ids. Read by the pagehide
+    // handler at fire time so it can dispatch a best-effort signed Leave for
+    // each room when the user closes the tab.
+    let live_topics: Rc<RefCell<Vec<String>>> = use_mut_ref(Vec::new);
 
     // Check localStorage on mount
     {
@@ -90,7 +95,7 @@ pub(crate) fn app() -> Html {
                             for r in &restored {
                                 let _ = gossip.send(ChatGossipCommand::Join {
                                     topic: r.topic_id.clone(),
-                                    topic_bytes: r.topic_bytes,
+                                    room_secret: r.room_secret,
                                     peers: r.bootstrap_peers.clone(),
                                     endpoint: ep.clone(),
                                     name: local_name.clone(),
@@ -113,6 +118,69 @@ pub(crate) fn app() -> Html {
                 });
             }
             || ()
+        });
+    }
+
+    // Keep live_topics in sync with the joined room list so the pagehide
+    // handler reads an up-to-date snapshot.
+    {
+        let live_topics = live_topics.clone();
+        let snapshot: Vec<String> = chat_state
+            .rooms
+            .iter()
+            .filter(|r| r.joined)
+            .map(|r| r.topic_id.clone())
+            .collect();
+        use_effect_with(snapshot.clone(), move |s| {
+            *live_topics.borrow_mut() = s.clone();
+            || ()
+        });
+    }
+
+    // Register a pagehide listener once we reach Ready. On tab close we
+    // dispatch a best-effort signed Leave for each currently-joined room.
+    // Browsers cut off async work during pagehide, so this is
+    // best-effort: peers may or may not receive the Leave before the
+    // sender's connection drops. They'll always see the transport-level
+    // NeighborDown afterward and render "X disconnected" instead.
+    {
+        let phase_val = (*phase).clone();
+        let live_topics = live_topics.clone();
+        let node_ref = node_ref.clone();
+        use_effect_with(matches!(phase_val, AppPhase::Ready), move |ready| {
+            let cleanup: Box<dyn FnOnce()> = if *ready {
+                let live_topics = live_topics.clone();
+                let node_ref = node_ref.clone();
+                let handler = Closure::<dyn FnMut()>::new(move || {
+                    let topics = live_topics.borrow().clone();
+                    let Some(gossip) = node_ref.borrow().as_ref().map(|h| h.gossip.clone()) else {
+                        return;
+                    };
+                    for topic in topics {
+                        let g = gossip.clone();
+                        spawn_local(async move {
+                            let _ = g.send(ChatGossipCommand::Leave { topic }).await;
+                        });
+                    }
+                });
+                let window = web_sys::window().expect("no window");
+                let _ = window.add_event_listener_with_callback(
+                    "pagehide",
+                    handler.as_ref().unchecked_ref(),
+                );
+                Box::new(move || {
+                    if let Some(window) = web_sys::window() {
+                        let _ = window.remove_event_listener_with_callback(
+                            "pagehide",
+                            handler.as_ref().unchecked_ref(),
+                        );
+                    }
+                    drop(handler);
+                })
+            } else {
+                Box::new(|| ())
+            };
+            cleanup
         });
     }
 

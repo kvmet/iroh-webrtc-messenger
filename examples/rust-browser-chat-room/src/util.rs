@@ -40,33 +40,34 @@ fn url_decode(s: &str) -> String {
         .unwrap_or_else(|| s.to_string())
 }
 
-/// Parsed invite: (topic_bytes, host_endpoint, optional proposed room name).
-/// Accepts either the bare `topic_b64|endpoint[|name]` payload or a full URL
-/// ending in that hash.
+/// Parsed invite: (room_secret, host_endpoint, optional proposed room name).
+/// Accepts either the bare `v2:<secret_b64>|<endpoint>[|<name>]` payload or
+/// a full URL ending in that hash.
 ///
-/// **Stability contract**: the format is positional pipe-separated. Adding
-/// a 4th positional field would silently break older parsers (the trailing
-/// segment would be appended to `name`). If a future version needs more
-/// fields, prefix the whole thing with a version tag (e.g. `v2:...`) so
-/// this parser fails cleanly on the topic decode and surfaces a clear
-/// "Invalid invite link" error instead of a quiet misparse.
+/// **Stability contract**: the format is `v2:` prefix + positional pipe-
+/// separated. Trailing segments beyond the third are explicitly ignored so
+/// a future v2+ extension can append optional data without breaking us.
+/// Bumping the prefix (`v3:` etc.) is the path for breaking changes; this
+/// parser will return None on unknown prefixes, which surfaces a clear
+/// "Invalid invite link" error rather than a silent misparse.
 ///
-/// Trailing segments beyond the third are explicitly ignored so that a
-/// future v1+ extension can append optional data without breaking us.
+/// v1 invites (no prefix, raw `topic_b64|endpoint`) are not supported;
+/// they fail to parse and the user must request a new invite.
 pub(crate) fn parse_invite(invite: &str) -> Option<([u8; 32], String, Option<String>)> {
     let payload = invite.find('#').map_or(invite, |i| &invite[i + 1..]).trim();
+    let payload = payload.strip_prefix("v2:")?;
     let mut parts = payload.split('|');
-    let topic_b64 = parts.next()?;
+    let secret_b64 = parts.next()?;
     let host = parts.next()?.trim();
     if host.is_empty() {
         return None;
     }
     let name = parts.next().map(url_decode).filter(|s| !s.is_empty());
-    Some((decode_topic_b64(topic_b64)?, host.to_string(), name))
+    Some((decode_topic_b64(secret_b64)?, host.to_string(), name))
 }
 
 pub(crate) fn make_invite_url(
-    topic_bytes: [u8; 32],
+    room_secret: [u8; 32],
     endpoint_id: &str,
     room_name: &str,
 ) -> Option<String> {
@@ -78,7 +79,7 @@ pub(crate) fn make_invite_url(
     } else {
         format!("|{}", url_encode(room_name))
     };
-    Some(format!("{}{}#{}|{}{}", origin, path, BASE64.encode(topic_bytes), endpoint_id, name_part))
+    Some(format!("{}{}#v2:{}|{}{}", origin, path, BASE64.encode(room_secret), endpoint_id, name_part))
 }
 
 pub(crate) fn make_qr_svg(text: &str) -> Option<String> {
