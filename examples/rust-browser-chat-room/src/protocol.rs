@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
+
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -15,7 +16,7 @@ use iroh_webrtc_transport::{
     Error, Result,
     browser::BrowserProtocol,
 };
-use n0_future::{StreamExt, task};
+use n0_future::{StreamExt, task, task::AbortOnDropHandle};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex as AsyncMutex, mpsc};
 
@@ -34,9 +35,6 @@ pub(crate) enum ChatGossipCommand {
         /// Raw topic bytes used as the AES-256-GCM encryption key for this room.
         #[serde(with = "serde_bytes_array")]
         topic_bytes: [u8; 32],
-        /// Caller's Ed25519 secret key bytes, used to sign outbound messages.
-        #[serde(with = "serde_bytes_array")]
-        secret_key: [u8; 32],
         peers: Vec<String>,
         endpoint: String,
         name: String,
@@ -46,6 +44,11 @@ pub(crate) enum ChatGossipCommand {
         from_endpoint: String,
         from_name: String,
         text: String,
+    },
+    /// Tear down a topic subscription. Aborts the receiver task and drops
+    /// the per-topic GossipSender so iroh-gossip releases the subscription.
+    Leave {
+        topic: String,
     },
 }
 
@@ -133,24 +136,31 @@ enum ChatWireMessage {
 
 #[derive(Debug, Clone)]
 pub(crate) struct ChatGossipProtocol {
+    /// The local user's Ed25519 signing key, fixed at construction.
+    /// Stored as a raw field rather than going through the command channel
+    /// so the key bytes don't traverse serde_json + base64 string heap.
+    secret_key: Arc<[u8; 32]>,
     gossip: Arc<StdMutex<Option<Gossip>>>,
     topics: Arc<StdMutex<HashMap<String, GossipSender>>>,
     /// Per-topic AES-256-GCM key (= the topic bytes).
     keys: Arc<StdMutex<HashMap<String, [u8; 32]>>>,
-    /// The local user's Ed25519 signing key, set once on the first Join.
-    signing_key: Arc<StdMutex<Option<[u8; 32]>>>,
+    /// Per-topic receiver task handle. Dropping the entry aborts the task,
+    /// which drops its GossipSender clone and the receiver, releasing the
+    /// iroh-gossip subscription.
+    tasks: Arc<StdMutex<HashMap<String, AbortOnDropHandle<()>>>>,
     events_tx: mpsc::UnboundedSender<ChatGossipEvent>,
     events_rx: Arc<AsyncMutex<mpsc::UnboundedReceiver<ChatGossipEvent>>>,
 }
 
-impl Default for ChatGossipProtocol {
-    fn default() -> Self {
+impl ChatGossipProtocol {
+    pub(crate) fn new(secret_key: [u8; 32]) -> Self {
         let (events_tx, events_rx) = mpsc::unbounded_channel();
         Self {
+            secret_key: Arc::new(secret_key),
             gossip: Arc::new(StdMutex::new(None)),
             topics: Arc::new(StdMutex::new(HashMap::new())),
             keys: Arc::new(StdMutex::new(HashMap::new())),
-            signing_key: Arc::new(StdMutex::new(None)),
+            tasks: Arc::new(StdMutex::new(HashMap::new())),
             events_tx,
             events_rx: Arc::new(AsyncMutex::new(events_rx)),
         }
@@ -169,14 +179,8 @@ impl BrowserProtocol for ChatGossipProtocol {
 
     async fn handle_command(&self, command: Self::Command) -> Result<()> {
         match command {
-            ChatGossipCommand::Join { topic, topic_bytes, secret_key, peers, endpoint, name } => {
-                // Store the signing key on first join (same key for all topics).
-                {
-                    let mut sk = self.signing_key.lock().expect("signing_key mutex poisoned");
-                    if sk.is_none() {
-                        *sk = Some(secret_key);
-                    }
-                }
+            ChatGossipCommand::Join { topic, topic_bytes, peers, endpoint, name } => {
+                let secret_key = *self.secret_key;
                 // Store the per-topic encryption key.
                 self.keys
                     .lock()
@@ -184,7 +188,8 @@ impl BrowserProtocol for ChatGossipProtocol {
                     .insert(topic.clone(), topic_bytes);
 
                 // If we already have a subscription to this topic in this
-                // session (e.g. user clicked Leave Room and then rejoined),
+                // session (rare now that Leave actually tears down, but still
+                // possible if Join is dispatched twice for the same topic),
                 // re-use it. Subscribing twice to the same topic in iroh-
                 // gossip leads to undefined mesh state and asymmetric
                 // delivery. We just re-emit Joined and re-broadcast our
@@ -244,7 +249,7 @@ impl BrowserProtocol for ChatGossipProtocol {
                 // Coalesces Sync responses: at most one pending re-announce
                 // per topic at a time, no matter how many Syncs arrive.
                 let pending_announce = Arc::new(AtomicBool::new(false));
-                task::spawn(async move {
+                let task_handle = task::spawn(async move {
                     while let Some(event) = receiver.next().await {
                         match event {
                             Ok(GossipEvent::NeighborUp(ep)) => {
@@ -358,6 +363,10 @@ impl BrowserProtocol for ChatGossipProtocol {
                         text: format!("left topic {topic_for_task}"),
                     });
                 });
+                self.tasks
+                    .lock()
+                    .expect("tasks mutex poisoned")
+                    .insert(topic.clone(), AbortOnDropHandle::new(task_handle));
                 let _ = self.events_tx.send(ChatGossipEvent::Joined { topic: topic.clone() });
                 let sig = sign_about_me(&secret_key, &topic_bytes, &endpoint, &name);
                 let events = self.events_tx.clone();
@@ -380,10 +389,9 @@ impl BrowserProtocol for ChatGossipProtocol {
                 });
             }
             ChatGossipCommand::Send { topic, from_endpoint, from_name, text } => {
-                let (sender, topic_bytes, secret_key) = {
+                let (sender, topic_bytes) = {
                     let topics = self.topics.lock().expect("topics mutex poisoned");
                     let keys = self.keys.lock().expect("keys mutex poisoned");
-                    let sk = self.signing_key.lock().expect("signing_key mutex poisoned");
                     let sender = topics
                         .get(&topic)
                         .cloned()
@@ -391,10 +399,9 @@ impl BrowserProtocol for ChatGossipProtocol {
                     let topic_bytes = *keys
                         .get(&topic)
                         .ok_or_else(|| Error::WebRtc(format!("no key for {topic}")))?;
-                    let secret_key = sk
-                        .ok_or_else(|| Error::WebRtc("signing key not initialized".into()))?;
-                    (sender, topic_bytes, secret_key)
+                    (sender, topic_bytes)
                 };
+                let secret_key = *self.secret_key;
                 let sig = sign_chat(&secret_key, &topic_bytes, &from_endpoint, &text);
                 let events = self.events_tx.clone();
                 let topic_for_err = topic.clone();
@@ -412,6 +419,25 @@ impl BrowserProtocol for ChatGossipProtocol {
                         });
                     }
                 });
+            }
+            ChatGossipCommand::Leave { topic } => {
+                // Drop the per-topic state. The AbortOnDropHandle aborts the
+                // receiver task when dropped, which releases its GossipSender
+                // clone and the receiver, letting iroh-gossip tear down the
+                // subscription. The sender clone we held in `topics` is also
+                // dropped here.
+                self.topics
+                    .lock()
+                    .expect("topics mutex poisoned")
+                    .remove(&topic);
+                self.keys
+                    .lock()
+                    .expect("keys mutex poisoned")
+                    .remove(&topic);
+                self.tasks
+                    .lock()
+                    .expect("tasks mutex poisoned")
+                    .remove(&topic);
             }
         }
         Ok(())

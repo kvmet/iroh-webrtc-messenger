@@ -28,7 +28,7 @@ pub(crate) async fn init_node(key_bytes: [u8; 32]) -> std::result::Result<NodeHa
             .with_protocol_transport_preference(BrowserDialTransportPreference::WebRtcOnly),
         secret_key,
     )
-    .protocol(ChatGossipProtocol::default())
+    .protocol(ChatGossipProtocol::new(key_bytes))
     .map_err(|e| JsValue::from_str(&e.to_string()))?
     .spawn()
     .await?;
@@ -76,7 +76,6 @@ pub(crate) async fn do_host(
     topic_b64: String,
     room_name: String,
     name: String,
-    key_bytes: [u8; 32],
     state: UseReducerHandle<AppState>,
 ) {
     let Some(topic_bytes) = decode_topic_b64(&topic_b64) else { return };
@@ -98,7 +97,6 @@ pub(crate) async fn do_host(
         .send(ChatGossipCommand::Join {
             topic: topic_id,
             topic_bytes,
-            secret_key: key_bytes,
             peers: vec![],
             endpoint,
             name,
@@ -112,7 +110,6 @@ pub(crate) async fn do_join(
     invite: String,
     room_name: String,
     name: String,
-    key_bytes: [u8; 32],
     state: UseReducerHandle<AppState>,
 ) -> std::result::Result<(), String> {
     let (topic_bytes, host, _proposed_name) = parse_invite(&invite)
@@ -138,13 +135,23 @@ pub(crate) async fn do_join(
         .send(ChatGossipCommand::Join {
             topic: topic_id,
             topic_bytes,
-            secret_key: key_bytes,
             peers: vec![host],
             endpoint,
             name,
         })
         .await;
     Ok(())
+}
+
+/// Send Leave to the gossip protocol (tears down the subscription) and
+/// remove the room from local UI state.
+pub(crate) async fn do_leave(
+    gossip: BrowserProtocolHandle<ChatGossipProtocol>,
+    topic_id: String,
+    state: UseReducerHandle<AppState>,
+) {
+    let _ = gossip.send(ChatGossipCommand::Leave { topic: topic_id.clone() }).await;
+    state.dispatch(Action::RemoveRoom(topic_id));
 }
 
 pub(crate) async fn do_send(

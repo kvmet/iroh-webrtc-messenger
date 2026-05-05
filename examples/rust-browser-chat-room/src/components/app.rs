@@ -5,7 +5,7 @@ use iroh::SecretKey;
 use wasm_bindgen_futures::spawn_local;
 use yew::prelude::*;
 
-use crate::commands::{NodeHandle, do_host, do_join, do_send, gossip_event_loop, init_node};
+use crate::commands::{NodeHandle, do_host, do_join, do_leave, do_send, gossip_event_loop, init_node};
 use crate::crypto::{decrypt_key, encrypt_key};
 use crate::protocol::ChatGossipCommand;
 use crate::state::{Action, AppState};
@@ -91,7 +91,6 @@ pub(crate) fn app() -> Html {
                                 let _ = gossip.send(ChatGossipCommand::Join {
                                     topic: r.topic_id.clone(),
                                     topic_bytes: r.topic_bytes,
-                                    secret_key: key_bytes,
                                     peers: r.bootstrap_peers.clone(),
                                     endpoint: ep.clone(),
                                     name: local_name.clone(),
@@ -202,7 +201,7 @@ pub(crate) fn app() -> Html {
                     let ep = endpoint_id.clone();
                     Callback::from(move |(topic_b64, room_name, name): (String, String, String)| {
                         let (g, cs, ep) = (gossip.clone(), chat_state.clone(), ep.clone());
-                        spawn_local(async move { do_host(g, ep, topic_b64, room_name, name, key_bytes, cs).await; });
+                        spawn_local(async move { do_host(g, ep, topic_b64, room_name, name, cs).await; });
                     })
                 };
                 let on_join = {
@@ -212,7 +211,7 @@ pub(crate) fn app() -> Html {
                     Callback::from(move |(invite, room_name, name): (String, String, String)| {
                         let (g, cs, ep) = (gossip.clone(), chat_state.clone(), ep.clone());
                         spawn_local(async move {
-                            if let Err(msg) = do_join(g, ep, invite, room_name, name, key_bytes, cs.clone()).await {
+                            if let Err(msg) = do_join(g, ep, invite, room_name, name, cs.clone()).await {
                                 cs.dispatch(Action::SetJoinError(Some(msg)));
                             }
                         });
@@ -238,9 +237,12 @@ pub(crate) fn app() -> Html {
                     })
                 };
                 let on_leave_room = {
+                    let gossip = gossip.clone();
                     let chat_state = chat_state.clone();
                     Callback::from(move |topic_id: String| {
-                        chat_state.dispatch(Action::RemoveRoom(topic_id));
+                        let g = gossip.clone();
+                        let cs = chat_state.clone();
+                        spawn_local(async move { do_leave(g, topic_id, cs).await; });
                     })
                 };
                 html! {

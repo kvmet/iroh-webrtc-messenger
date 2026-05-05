@@ -72,13 +72,10 @@ impl Reducible for AppState {
                 }
             }
             Action::RemoveRoom(topic) => {
-                // State-only leave: the room and its messages disappear from
-                // the UI and the persisted profile. The underlying iroh-gossip
-                // subscription and its receiver task continue running until
-                // page reload — this is intentional for now (a real protocol-
-                // level cancellation is more involved). The protocol's Join
-                // handler short-circuits to a re-broadcast if the user later
-                // rejoins the same topic in this session.
+                // Removes the room from the UI and the persisted profile.
+                // The protocol-level subscription teardown is driven by
+                // ChatGossipCommand::Leave, which the caller (do_leave)
+                // dispatches before/around this state action.
                 s.rooms.retain(|r| r.topic_id != topic);
                 if s.active_topic.as_deref() == Some(topic.as_str()) {
                     s.active_topic = s.rooms.first().map(|r| r.topic_id.clone());
