@@ -212,7 +212,7 @@ pub(crate) fn chat_room(props: &ChatRoomProps) -> Html {
     html! {
         <div class="aim-window flex flex-col h-full">
             <div class="aim-titlebar">
-                <button class="md:hidden aim-btn px-1 py-0 text-xs mr-1"
+                <button class="md:hidden aim-btn px-2 py-1 text-sm leading-none mr-1"
                     onclick={Callback::from({let s = sidebar_open.clone(); move |_: MouseEvent| s.set(!*s)})}>
                     {"☰"}
                 </button>
@@ -230,7 +230,7 @@ pub(crate) fn chat_room(props: &ChatRoomProps) -> Html {
                     <div class="aim-window relative max-w-[90vw]">
                         <div class="aim-titlebar">
                             {"Invite QR Code"}
-                            <button class="ml-auto aim-btn px-1 py-0 text-xs"
+                            <button class="ml-auto aim-btn px-2 py-1 text-sm leading-none"
                                 onclick={Callback::from({let s = qr_url.clone(); move |_: MouseEvent| s.set(None)})}>
                                 {"x"}
                             </button>
@@ -253,7 +253,7 @@ pub(crate) fn chat_room(props: &ChatRoomProps) -> Html {
                     <div class="aim-window w-72 relative">
                         <div class="aim-titlebar">
                             {"New Room"}
-                            <button class="ml-auto aim-btn px-1 py-0 text-xs"
+                            <button class="ml-auto aim-btn px-2 py-1 text-sm leading-none"
                                 onclick={Callback::from({let s = show_host_modal.clone(); move |_: MouseEvent| s.set(false)})}>
                                 {"x"}
                             </button>
@@ -283,7 +283,7 @@ pub(crate) fn chat_room(props: &ChatRoomProps) -> Html {
                     <div class="aim-window w-72 relative">
                         <div class="aim-titlebar">
                             {"Join Room"}
-                            <button class="ml-auto aim-btn px-1 py-0 text-xs"
+                            <button class="ml-auto aim-btn px-2 py-1 text-sm leading-none"
                                 onclick={Callback::from({let s = show_join_modal.clone(); move |_: MouseEvent| s.set(false)})}>
                                 {"x"}
                             </button>
@@ -352,7 +352,7 @@ pub(crate) fn chat_room(props: &ChatRoomProps) -> Html {
                     </div>
 
                     <div class="p-2 border-b border-[#808080] flex gap-1">
-                        <button class="aim-btn flex-1 px-1"
+                        <button class="aim-btn flex-1"
                             onclick={Callback::from({
                                 let s = show_host_modal.clone();
                                 let rn = room_name_input.clone();
@@ -360,7 +360,7 @@ pub(crate) fn chat_room(props: &ChatRoomProps) -> Html {
                             })}>
                             {"New Room"}
                         </button>
-                        <button class="aim-btn flex-1 px-1"
+                        <button class="aim-btn flex-1"
                             onclick={Callback::from({
                                 let s = show_join_modal.clone();
                                 let rn = room_name_input.clone();
@@ -405,17 +405,17 @@ pub(crate) fn chat_room(props: &ChatRoomProps) -> Html {
                                                             </span>
                                                         }
                                                     </span>
-                                                    <button class="px-1 text-[11px] opacity-50 hover:opacity-100 shrink-0"
+                                                    <button class="aim-btn px-2 py-1 text-sm leading-none shrink-0"
                                                         onclick={Callback::from(move |e: MouseEvent| {
                                                             e.stop_propagation();
                                                             open_menu_h.set(if is_menu_open { None } else { Some(menu_tid.clone()) });
                                                         })}>
-                                                        {"..."}
+                                                        {"⋯"}
                                                     </button>
                                                 </div>
                                                 if open_menu.as_deref() == Some(room.topic_id.as_str()) {
-                                                    <div class="aim-window absolute right-0 min-w-[140px]" style="top:100%;z-index:30">
-                                                        <button class="block w-full text-left aim-buddy text-[11px]"
+                                                    <div class="aim-window absolute right-0 min-w-[160px]" style="top:100%;z-index:30">
+                                                        <button class="block w-full text-left px-3 py-2 text-sm hover:bg-[#000080] hover:text-white"
                                                             onclick={Callback::from({
                                                                 let url = invite_url.clone();
                                                                 let om = open_menu.clone();
@@ -423,7 +423,7 @@ pub(crate) fn chat_room(props: &ChatRoomProps) -> Html {
                                                             })}>
                                                             {"Copy invite link"}
                                                         </button>
-                                                        <button class="block w-full text-left aim-buddy text-[11px]"
+                                                        <button class="block w-full text-left px-3 py-2 text-sm hover:bg-[#000080] hover:text-white"
                                                             onclick={Callback::from({
                                                                 let url = invite_url.clone();
                                                                 let om = open_menu.clone();
