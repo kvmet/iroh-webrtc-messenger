@@ -1,4 +1,5 @@
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD as BASE64};
+use iroh_gossip::TopicId;
 use js_sys::Uint8Array;
 use wasm_bindgen_futures::spawn_local;
 use web_sys::{HtmlElement, HtmlInputElement, HtmlTextAreaElement};
@@ -6,7 +7,7 @@ use yew::prelude::*;
 
 use crate::state::{AppState, RoomMode};
 use crate::storage::{save_name, save_profile};
-use crate::util::{copy_to_clipboard, make_invite_url, make_qr_svg};
+use crate::util::{copy_to_clipboard, make_invite_url, make_qr_svg, parse_invite};
 
 #[derive(Properties, PartialEq)]
 pub(crate) struct ChatRoomProps {
@@ -47,13 +48,30 @@ pub(crate) fn chat_room(props: &ChatRoomProps) -> Html {
     let qr_url: UseStateHandle<Option<String>> = use_state(|| None);
     let sidebar_open = use_state(|| false);
 
-    // Auto-open join modal when arriving via invite link
+    // On mount, decide what to do with a URL hash invite:
+    //   - if it points at a room we already have, just switch to it
+    //   - otherwise pre-fill the proposed room name and open the join modal
     use_effect_with((), {
         let host_input = host_input.clone();
         let show_join_modal = show_join_modal.clone();
+        let room_name_input = room_name_input.clone();
+        let rooms = props.state.rooms.clone();
+        let switch = props.on_switch_room.clone();
         move |_| {
             if !(*host_input).is_empty() {
-                show_join_modal.set(true);
+                if let Some((topic_bytes, _host, name)) = parse_invite(&host_input) {
+                    let topic_id = TopicId::from_bytes(topic_bytes).to_string();
+                    if rooms.iter().any(|r| r.topic_id == topic_id) {
+                        switch.emit(topic_id);
+                    } else {
+                        if let Some(n) = name {
+                            room_name_input.set(n);
+                        }
+                        show_join_modal.set(true);
+                    }
+                } else {
+                    show_join_modal.set(true);
+                }
             }
             || ()
         }
@@ -107,9 +125,18 @@ pub(crate) fn chat_room(props: &ChatRoomProps) -> Html {
     };
     let on_host_input = {
         let host_input = host_input.clone();
+        let room_name_input = room_name_input.clone();
         Callback::from(move |e: InputEvent| {
             let el: HtmlInputElement = e.target_unchecked_into();
-            host_input.set(el.value());
+            let v = el.value();
+            // Auto-fill the room name from the pasted invite, but only if the
+            // user hasn't customized the field yet.
+            if (*room_name_input).as_str() == "general" {
+                if let Some((_, _, Some(name))) = parse_invite(&v) {
+                    room_name_input.set(name);
+                }
+            }
+            host_input.set(v);
         })
     };
     let on_room_name_input = {
@@ -384,7 +411,7 @@ pub(crate) fn chat_room(props: &ChatRoomProps) -> Html {
                                         let menu_tid = tid.clone();
                                         let open_menu_h = open_menu.clone();
                                         let is_menu_open = open_menu.as_deref() == Some(room.topic_id.as_str());
-                                        let invite_url = make_invite_url(room.topic_bytes, &props.endpoint_id)
+                                        let invite_url = make_invite_url(room.topic_bytes, &props.endpoint_id, &room.name)
                                             .unwrap_or_default();
                                         html! {
                                             <li class="relative">

@@ -106,7 +106,7 @@ pub(crate) async fn do_join(
     name: String,
     state: UseReducerHandle<AppState>,
 ) -> std::result::Result<(), String> {
-    let (topic_bytes, host) = parse_invite(&invite)
+    let (topic_bytes, host, _proposed_name) = parse_invite(&invite)
         .ok_or_else(|| String::from("Invalid invite link"))?;
     if host == endpoint {
         return Err("That's your own invite link.".into());

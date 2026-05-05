@@ -27,23 +27,46 @@ pub(crate) fn decode_topic_b64(s: &str) -> Option<[u8; 32]> {
     BASE64.decode(s).ok()?.try_into().ok()
 }
 
-/// Parse an invite into (topic_bytes, host_endpoint). Accepts either the bare
-/// `topic_b64|endpoint` payload or a full URL ending in that hash.
-pub(crate) fn parse_invite(invite: &str) -> Option<([u8; 32], String)> {
+fn url_encode(s: &str) -> String {
+    js_sys::encode_uri_component(s).as_string().unwrap_or_default()
+}
+
+fn url_decode(s: &str) -> String {
+    js_sys::decode_uri_component(s)
+        .ok()
+        .and_then(|j| j.as_string())
+        .unwrap_or_else(|| s.to_string())
+}
+
+/// Parsed invite: (topic_bytes, host_endpoint, optional proposed room name).
+/// Accepts either the bare `topic_b64|endpoint[|name]` payload or a full URL
+/// ending in that hash.
+pub(crate) fn parse_invite(invite: &str) -> Option<([u8; 32], String, Option<String>)> {
     let payload = invite.find('#').map_or(invite, |i| &invite[i + 1..]).trim();
-    let (topic_b64, host) = payload.split_once('|')?;
-    let host = host.trim();
+    let mut parts = payload.splitn(3, '|');
+    let topic_b64 = parts.next()?;
+    let host = parts.next()?.trim();
     if host.is_empty() {
         return None;
     }
-    Some((decode_topic_b64(topic_b64)?, host.to_string()))
+    let name = parts.next().map(url_decode).filter(|s| !s.is_empty());
+    Some((decode_topic_b64(topic_b64)?, host.to_string(), name))
 }
 
-pub(crate) fn make_invite_url(topic_bytes: [u8; 32], endpoint_id: &str) -> Option<String> {
+pub(crate) fn make_invite_url(
+    topic_bytes: [u8; 32],
+    endpoint_id: &str,
+    room_name: &str,
+) -> Option<String> {
     let loc = web_sys::window()?.location();
     let origin = loc.origin().ok()?;
     let path = loc.pathname().ok()?;
-    Some(format!("{}{}#{}|{}", origin, path, BASE64.encode(topic_bytes), endpoint_id))
+    let name_part = if room_name.is_empty() {
+        String::new()
+    } else {
+        format!("|{}", url_encode(room_name))
+    };
+    Some(format!("{}{}#{}|{}{}", origin, path, BASE64.encode(topic_bytes), endpoint_id, name_part))
 }
 
 pub(crate) fn make_qr_svg(text: &str) -> Option<String> {
