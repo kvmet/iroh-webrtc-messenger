@@ -317,9 +317,10 @@ pub(crate) fn chat_room(props: &ChatRoomProps) -> Html {
                 </div>
             }
 
-            // Outside-click catcher for meatball menu
+            // Outside-click catcher for meatball menu. Sits below the sidebar
+            // (z-20) so menu items inside the sidebar still receive clicks.
             if open_menu.is_some() {
-                <div class="fixed inset-0" style="z-index:25"
+                <div class="fixed inset-0" style="z-index:15"
                     onclick={Callback::from({let om = open_menu.clone(); move |_: MouseEvent| om.set(None)})} />
             }
 
@@ -389,9 +390,13 @@ pub(crate) fn chat_room(props: &ChatRoomProps) -> Html {
                                             <li class="relative">
                                                 <div class={if is_active { "flex items-center bg-[#000080] text-white" } else { "flex items-center" }}>
                                                     <span class="flex-1 aim-buddy truncate"
-                                                        onclick={Callback::from(move |_: MouseEvent| {
-                                                            switch_cb.emit(tid.clone());
-                                                            sidebar_close.set(false);
+                                                        onclick={Callback::from({
+                                                            let om = open_menu.clone();
+                                                            move |_: MouseEvent| {
+                                                                switch_cb.emit(tid.clone());
+                                                                sidebar_close.set(false);
+                                                                om.set(None);
+                                                            }
                                                         })}>
                                                         {format!("#{}", room.name)}
                                                         if !room.participants.is_empty() {
