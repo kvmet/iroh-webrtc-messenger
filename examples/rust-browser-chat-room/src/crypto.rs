@@ -1,4 +1,5 @@
-//! Web Crypto wrappers for identity and profile encryption.
+//! Web Crypto wrappers for identity and profile encryption, plus Ed25519
+//! message signing using iroh's key primitives.
 //!
 //! ## Forward-compatibility contract
 //!
@@ -11,6 +12,7 @@
 //! Version 1: PBKDF2-HMAC-SHA256, 600_000 iter, 16-byte salt, 12-byte IV,
 //!            AES-256-GCM. Plaintext layout is whatever the caller uses.
 
+use iroh::{PublicKey, SecretKey, Signature};
 use js_sys::{Array, Object, Reflect, Uint8Array};
 use wasm_bindgen::{JsCast, prelude::*};
 use wasm_bindgen_futures::JsFuture;
@@ -178,6 +180,19 @@ pub(crate) async fn encrypt_data(
     result.extend_from_slice(&iv);
     result.extend_from_slice(&Uint8Array::new(&ct).to_vec());
     Ok(result)
+}
+
+/// Signs `msg` with the caller's Ed25519 secret key. Returns the 64-byte signature.
+pub(crate) fn sign_msg(secret_key_bytes: &[u8; 32], msg: &[u8]) -> Vec<u8> {
+    SecretKey::from_bytes(secret_key_bytes).sign(msg).to_bytes().to_vec()
+}
+
+/// Verifies an Ed25519 signature against a peer's endpoint string (= public key).
+/// Returns false on any parse or verification failure.
+pub(crate) fn verify_msg(endpoint_str: &str, msg: &[u8], sig_bytes: &[u8]) -> bool {
+    let Ok(pk) = endpoint_str.parse::<PublicKey>() else { return false };
+    let Ok(arr): Result<&[u8; 64], _> = sig_bytes.try_into() else { return false };
+    pk.verify(msg, &Signature::from_bytes(arr)).is_ok()
 }
 
 pub(crate) async fn decrypt_data(

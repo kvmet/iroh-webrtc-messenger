@@ -82,6 +82,8 @@ pub(crate) fn app() -> Html {
                             for r in &restored {
                                 let _ = gossip.send(ChatGossipCommand::Join {
                                     topic: r.topic_id.clone(),
+                                    topic_bytes: r.topic_bytes,
+                                    secret_key: key_bytes,
                                     peers: r.bootstrap_peers.clone(),
                                     endpoint: ep.clone(),
                                     name: local_name.clone(),
@@ -189,7 +191,7 @@ pub(crate) fn app() -> Html {
                     let ep = endpoint_id.clone();
                     Callback::from(move |(topic_b64, room_name, name): (String, String, String)| {
                         let (g, cs, ep) = (gossip.clone(), chat_state.clone(), ep.clone());
-                        spawn_local(async move { do_host(g, ep, topic_b64, room_name, name, cs).await; });
+                        spawn_local(async move { do_host(g, ep, topic_b64, room_name, name, key_bytes, cs).await; });
                     })
                 };
                 let on_join = {
@@ -199,7 +201,7 @@ pub(crate) fn app() -> Html {
                     Callback::from(move |(invite, room_name, name): (String, String, String)| {
                         let (g, cs, ep) = (gossip.clone(), chat_state.clone(), ep.clone());
                         spawn_local(async move {
-                            if let Err(msg) = do_join(g, ep, invite, room_name, name, cs.clone()).await {
+                            if let Err(msg) = do_join(g, ep, invite, room_name, name, key_bytes, cs.clone()).await {
                                 cs.dispatch(Action::SetJoinError(Some(msg)));
                             }
                         });

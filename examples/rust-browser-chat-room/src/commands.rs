@@ -76,6 +76,7 @@ pub(crate) async fn do_host(
     topic_b64: String,
     room_name: String,
     name: String,
+    key_bytes: [u8; 32],
     state: UseReducerHandle<AppState>,
 ) {
     let Some(topic_bytes) = decode_topic_b64(&topic_b64) else { return };
@@ -94,7 +95,14 @@ pub(crate) async fn do_host(
     }));
 
     let _ = gossip
-        .send(ChatGossipCommand::Join { topic: topic_id, peers: vec![], endpoint, name })
+        .send(ChatGossipCommand::Join {
+            topic: topic_id,
+            topic_bytes,
+            secret_key: key_bytes,
+            peers: vec![],
+            endpoint,
+            name,
+        })
         .await;
 }
 
@@ -104,6 +112,7 @@ pub(crate) async fn do_join(
     invite: String,
     room_name: String,
     name: String,
+    key_bytes: [u8; 32],
     state: UseReducerHandle<AppState>,
 ) -> std::result::Result<(), String> {
     let (topic_bytes, host, _proposed_name) = parse_invite(&invite)
@@ -126,7 +135,14 @@ pub(crate) async fn do_join(
     }));
 
     let _ = gossip
-        .send(ChatGossipCommand::Join { topic: topic_id, peers: vec![host], endpoint, name })
+        .send(ChatGossipCommand::Join {
+            topic: topic_id,
+            topic_bytes,
+            secret_key: key_bytes,
+            peers: vec![host],
+            endpoint,
+            name,
+        })
         .await;
     Ok(())
 }

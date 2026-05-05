@@ -19,6 +19,7 @@ use n0_future::{StreamExt, task};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex as AsyncMutex, mpsc};
 
+use crate::crypto::{decrypt_data, encrypt_data, sign_msg, verify_msg};
 use crate::util::truncate_chars;
 
 pub(crate) const MAX_WIRE_BYTES: usize = 8192;
@@ -30,6 +31,12 @@ pub(crate) const MAX_TEXT_CHARS: usize = 4000;
 pub(crate) enum ChatGossipCommand {
     Join {
         topic: String,
+        /// Raw topic bytes used as the AES-256-GCM encryption key for this room.
+        #[serde(with = "serde_bytes_array")]
+        topic_bytes: [u8; 32],
+        /// Caller's Ed25519 secret key bytes, used to sign outbound messages.
+        #[serde(with = "serde_bytes_array")]
+        secret_key: [u8; 32],
         peers: Vec<String>,
         endpoint: String,
         name: String,
@@ -40,6 +47,22 @@ pub(crate) enum ChatGossipCommand {
         from_name: String,
         text: String,
     },
+}
+
+/// serde helper: serialize/deserialize [u8; 32] as a base64 string.
+mod serde_bytes_array {
+    use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(v: &[u8; 32], s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&B64.encode(v))
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<[u8; 32], D::Error> {
+        let s = String::deserialize(d)?;
+        let v = B64.decode(&s).map_err(serde::de::Error::custom)?;
+        v.try_into().map_err(|_| serde::de::Error::custom("expected 32 bytes"))
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -81,6 +104,10 @@ enum ChatWireMessage {
         endpoint: String,
         #[serde(default)]
         name: String,
+        /// Ed25519 signature over topic_bytes || endpoint.as_bytes() || name_utf8.
+        /// Required; messages with an absent or invalid signature are dropped.
+        #[serde(default)]
+        sig: Vec<u8>,
     },
     Chat {
         #[serde(default)]
@@ -89,6 +116,10 @@ enum ChatWireMessage {
         from_name: String,
         #[serde(default)]
         text: String,
+        /// Ed25519 signature over topic_bytes || from_endpoint.as_bytes() || text_utf8.
+        /// Required; messages with an absent or invalid signature are dropped.
+        #[serde(default)]
+        sig: Vec<u8>,
     },
     /// Request: "everyone in this topic, please re-announce yourselves."
     /// Sent on join (and on rejoin) so the requester populates their
@@ -104,6 +135,10 @@ enum ChatWireMessage {
 pub(crate) struct ChatGossipProtocol {
     gossip: Arc<StdMutex<Option<Gossip>>>,
     topics: Arc<StdMutex<HashMap<String, GossipSender>>>,
+    /// Per-topic AES-256-GCM key (= the topic bytes).
+    keys: Arc<StdMutex<HashMap<String, [u8; 32]>>>,
+    /// The local user's Ed25519 signing key, set once on the first Join.
+    signing_key: Arc<StdMutex<Option<[u8; 32]>>>,
     events_tx: mpsc::UnboundedSender<ChatGossipEvent>,
     events_rx: Arc<AsyncMutex<mpsc::UnboundedReceiver<ChatGossipEvent>>>,
 }
@@ -114,6 +149,8 @@ impl Default for ChatGossipProtocol {
         Self {
             gossip: Arc::new(StdMutex::new(None)),
             topics: Arc::new(StdMutex::new(HashMap::new())),
+            keys: Arc::new(StdMutex::new(HashMap::new())),
+            signing_key: Arc::new(StdMutex::new(None)),
             events_tx,
             events_rx: Arc::new(AsyncMutex::new(events_rx)),
         }
@@ -132,7 +169,20 @@ impl BrowserProtocol for ChatGossipProtocol {
 
     async fn handle_command(&self, command: Self::Command) -> Result<()> {
         match command {
-            ChatGossipCommand::Join { topic, peers, endpoint, name } => {
+            ChatGossipCommand::Join { topic, topic_bytes, secret_key, peers, endpoint, name } => {
+                // Store the signing key on first join (same key for all topics).
+                {
+                    let mut sk = self.signing_key.lock().expect("signing_key mutex poisoned");
+                    if sk.is_none() {
+                        *sk = Some(secret_key);
+                    }
+                }
+                // Store the per-topic encryption key.
+                self.keys
+                    .lock()
+                    .expect("keys mutex poisoned")
+                    .insert(topic.clone(), topic_bytes);
+
                 // If we already have a subscription to this topic in this
                 // session (e.g. user clicked Leave Room and then rejoined),
                 // re-use it. Subscribing twice to the same topic in iroh-
@@ -147,13 +197,18 @@ impl BrowserProtocol for ChatGossipProtocol {
                     .cloned();
                 if let Some(existing_sender) = already {
                     let _ = self.events_tx.send(ChatGossipEvent::Joined { topic: topic.clone() });
-                    broadcast_wire(
-                        &existing_sender,
-                        ChatWireMessage::AboutMe { endpoint, name },
-                    )
-                    .await?;
-                    // Re-Sync so we repopulate any state we lost on Leave.
-                    let _ = broadcast_wire(&existing_sender, ChatWireMessage::Sync).await;
+                    let sig = sign_about_me(&secret_key, &topic_bytes, &endpoint, &name);
+                    // spawn_local: encrypt_data uses JsFuture (!Send), can't be awaited
+                    // directly in handle_command which must return a Send future.
+                    wasm_bindgen_futures::spawn_local(async move {
+                        let _ = broadcast_encrypted(
+                            &existing_sender,
+                            ChatWireMessage::AboutMe { endpoint, name, sig },
+                            &topic_bytes,
+                        )
+                        .await;
+                        let _ = broadcast_encrypted(&existing_sender, ChatWireMessage::Sync, &topic_bytes).await;
+                    });
                     return Ok(());
                 }
                 let topic_id = parse_topic(&topic)?;
@@ -184,12 +239,15 @@ impl BrowserProtocol for ChatGossipProtocol {
                                     topic: topic_for_task.clone(),
                                     endpoint: ep.to_string(),
                                 });
-                                if let Err(e) = broadcast_wire(
+                                let sig = sign_about_me(&secret_key, &topic_bytes, &endpoint_for_task, &name_for_task);
+                                if let Err(e) = broadcast_encrypted(
                                     &sender_for_task,
                                     ChatWireMessage::AboutMe {
                                         endpoint: endpoint_for_task.clone(),
                                         name: name_for_task.clone(),
+                                        sig,
                                     },
+                                    &topic_bytes,
                                 )
                                 .await
                                 {
@@ -207,11 +265,17 @@ impl BrowserProtocol for ChatGossipProtocol {
                             }
                             Ok(GossipEvent::Received(msg)) => {
                                 if msg.content.len() > MAX_WIRE_BYTES { continue; }
+                                // Decrypt before parsing. Drop silently if decryption fails
+                                // (wrong key = not in this room, or corrupted packet).
+                                let Ok(plaintext) = decrypt_data(&msg.content, &topic_bytes).await else { continue };
                                 if let Ok(wire) =
-                                    serde_json::from_slice::<ChatWireMessage>(&msg.content)
+                                    serde_json::from_slice::<ChatWireMessage>(&plaintext)
                                 {
                                     match wire {
-                                        ChatWireMessage::AboutMe { endpoint, mut name } => {
+                                        ChatWireMessage::AboutMe { endpoint, mut name, sig } => {
+                                            // Verify sig before accepting identity claim.
+                                            let payload = about_me_payload(&topic_bytes, &endpoint, &name);
+                                            if !verify_msg(&endpoint, &payload, &sig) { continue; }
                                             truncate_chars(&mut name, MAX_NAME_CHARS);
                                             let _ = events.send(ChatGossipEvent::Identify {
                                                 topic: topic_for_task.clone(),
@@ -219,7 +283,10 @@ impl BrowserProtocol for ChatGossipProtocol {
                                                 name,
                                             });
                                         }
-                                        ChatWireMessage::Chat { from_endpoint, mut from_name, mut text } => {
+                                        ChatWireMessage::Chat { from_endpoint, mut from_name, mut text, sig } => {
+                                            // Verify sig before delivering the message.
+                                            let payload = chat_payload(&topic_bytes, &from_endpoint, &text);
+                                            if !verify_msg(&from_endpoint, &payload, &sig) { continue; }
                                             truncate_chars(&mut from_name, MAX_NAME_CHARS);
                                             truncate_chars(&mut text, MAX_TEXT_CHARS);
                                             let _ = events.send(ChatGossipEvent::Chat {
@@ -244,9 +311,11 @@ impl BrowserProtocol for ChatGossipProtocol {
                                                 task::spawn(async move {
                                                     let jitter_ms = jitter_for(&ep);
                                                     n0_future::time::sleep(Duration::from_millis(jitter_ms)).await;
-                                                    let _ = broadcast_wire(
+                                                    let sig = sign_about_me(&secret_key, &topic_bytes, &ep, &nm);
+                                                    let _ = broadcast_encrypted(
                                                         &snd,
-                                                        ChatWireMessage::AboutMe { endpoint: ep, name: nm },
+                                                        ChatWireMessage::AboutMe { endpoint: ep, name: nm, sig },
+                                                        &topic_bytes,
                                                     ).await;
                                                     pending.store(false, Ordering::SeqCst);
                                                 });
@@ -277,21 +346,39 @@ impl BrowserProtocol for ChatGossipProtocol {
                     });
                 });
                 let _ = self.events_tx.send(ChatGossipEvent::Joined { topic: topic.clone() });
-                broadcast_wire(&sender, ChatWireMessage::AboutMe { endpoint, name }).await?;
-                // Ask everyone in the topic to re-announce themselves so we
-                // populate our name map without periodic keepalive traffic.
-                let _ = broadcast_wire(&sender, ChatWireMessage::Sync).await;
+                let sig = sign_about_me(&secret_key, &topic_bytes, &endpoint, &name);
+                wasm_bindgen_futures::spawn_local(async move {
+                    let _ = broadcast_encrypted(&sender, ChatWireMessage::AboutMe { endpoint, name, sig }, &topic_bytes).await;
+                    // Ask everyone in the topic to re-announce themselves so we
+                    // populate our name map without periodic keepalive traffic.
+                    let _ = broadcast_encrypted(&sender, ChatWireMessage::Sync, &topic_bytes).await;
+                });
             }
             ChatGossipCommand::Send { topic, from_endpoint, from_name, text } => {
-                let sender = self
-                    .topics
-                    .lock()
-                    .expect("topics mutex poisoned")
-                    .get(&topic)
-                    .cloned()
-                    .ok_or_else(|| Error::WebRtc(format!("not joined to {topic}")))?;
-                broadcast_wire(&sender, ChatWireMessage::Chat { from_endpoint, from_name, text })
-                    .await?;
+                let (sender, topic_bytes, secret_key) = {
+                    let topics = self.topics.lock().expect("topics mutex poisoned");
+                    let keys = self.keys.lock().expect("keys mutex poisoned");
+                    let sk = self.signing_key.lock().expect("signing_key mutex poisoned");
+                    let sender = topics
+                        .get(&topic)
+                        .cloned()
+                        .ok_or_else(|| Error::WebRtc(format!("not joined to {topic}")))?;
+                    let topic_bytes = *keys
+                        .get(&topic)
+                        .ok_or_else(|| Error::WebRtc(format!("no key for {topic}")))?;
+                    let secret_key = sk
+                        .ok_or_else(|| Error::WebRtc("signing key not initialized".into()))?;
+                    (sender, topic_bytes, secret_key)
+                };
+                let sig = sign_chat(&secret_key, &topic_bytes, &from_endpoint, &text);
+                wasm_bindgen_futures::spawn_local(async move {
+                    let _ = broadcast_encrypted(
+                        &sender,
+                        ChatWireMessage::Chat { from_endpoint, from_name, text, sig },
+                        &topic_bytes,
+                    )
+                    .await;
+                });
             }
         }
         Ok(())
@@ -332,10 +419,41 @@ fn jitter_for(endpoint: &str) -> u64 {
     (h as u64) % 3000
 }
 
-async fn broadcast_wire(sender: &GossipSender, msg: ChatWireMessage) -> Result<()> {
+/// Serialize, encrypt with the topic key, and broadcast.
+async fn broadcast_encrypted(sender: &GossipSender, msg: ChatWireMessage, key: &[u8; 32]) -> Result<()> {
     let encoded = serde_json::to_vec(&msg)
         .map_err(|e| Error::WebRtc(format!("encode error: {e}")))?;
-    sender.broadcast(Bytes::from(encoded)).await.map_err(error_from_display)
+    let encrypted = encrypt_data(&encoded, key)
+        .await
+        .map_err(|e| Error::WebRtc(format!("encrypt error: {e:?}")))?;
+    sender.broadcast(Bytes::from(encrypted)).await.map_err(error_from_display)
+}
+
+/// Signed payload for an AboutMe: topic_bytes || endpoint_bytes_as_public_key || name_utf8.
+/// Including topic_bytes prevents cross-room replay of identity claims.
+fn about_me_payload(topic_bytes: &[u8; 32], endpoint: &str, name: &str) -> Vec<u8> {
+    let mut v = Vec::with_capacity(32 + endpoint.len() + name.len());
+    v.extend_from_slice(topic_bytes);
+    v.extend_from_slice(endpoint.as_bytes());
+    v.extend_from_slice(name.as_bytes());
+    v
+}
+
+fn sign_about_me(secret_key: &[u8; 32], topic_bytes: &[u8; 32], endpoint: &str, name: &str) -> Vec<u8> {
+    sign_msg(secret_key, &about_me_payload(topic_bytes, endpoint, name))
+}
+
+/// Signed payload for a Chat: topic_bytes || from_endpoint_bytes || text_utf8.
+fn chat_payload(topic_bytes: &[u8; 32], from_endpoint: &str, text: &str) -> Vec<u8> {
+    let mut v = Vec::with_capacity(32 + from_endpoint.len() + text.len());
+    v.extend_from_slice(topic_bytes);
+    v.extend_from_slice(from_endpoint.as_bytes());
+    v.extend_from_slice(text.as_bytes());
+    v
+}
+
+fn sign_chat(secret_key: &[u8; 32], topic_bytes: &[u8; 32], from_endpoint: &str, text: &str) -> Vec<u8> {
+    sign_msg(secret_key, &chat_payload(topic_bytes, from_endpoint, text))
 }
 
 fn parse_topic(topic: &str) -> Result<TopicId> {
