@@ -41,3 +41,10 @@ yew = { version = "0.23.0", features = ["csr"] }
 base64 = "0.22.1"
 js-sys = "0.3"
 qrcode = { version = "0.14.1", default-features = false, features = ["svg"] }
+
+[profile.release]
+opt-level = "z"      # optimize for size (vs "3" = speed). Big wasm shrink.
+lto = true           # link-time optimization. Inlines across crates.
+codegen-units = 1    # single codegen unit. Slower compile, smaller output.
+strip = true         # strip symbols. Marginal but free.
+panic = "abort"      # no unwinding. Smaller, slightly faster.
