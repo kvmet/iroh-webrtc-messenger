@@ -1,6 +1,8 @@
 use std::collections::HashMap;
 use std::str::FromStr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
+use std::time::Duration;
 
 use bytes::Bytes;
 use iroh::{Endpoint, EndpointId};
@@ -61,6 +63,16 @@ pub(crate) enum ChatGossipEvent {
 ///   [`ChatWireMessage::Unknown`] and silently no-op.
 /// - There is no version field by design. Forward compatibility is
 ///   maintained by convention, not negotiation.
+///
+/// ## Discovery protocol
+///
+/// Peer-name discovery is event-driven, not periodic. On joining a
+/// topic, a peer broadcasts its own [`AboutMe`] followed by [`Sync`].
+/// Receivers of `Sync` schedule a jittered (0–3s) re-broadcast of
+/// their own `AboutMe`, with a per-topic coalescing flag so multiple
+/// Syncs in quick succession produce at most one response. Steady-
+/// state idle traffic is zero. New joiners learn the room within
+/// ~3 seconds without periodic heartbeats from everyone.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
 enum ChatWireMessage {
@@ -78,6 +90,10 @@ enum ChatWireMessage {
         #[serde(default)]
         text: String,
     },
+    /// Request: "everyone in this topic, please re-announce yourselves."
+    /// Sent on join (and on rejoin) so the requester populates their
+    /// name map without the network having to keepalive periodically.
+    Sync,
     /// Catch-all for variants this client doesn't know about.
     /// Treated as a no-op by the receiver.
     #[serde(other)]
@@ -117,6 +133,29 @@ impl BrowserProtocol for ChatGossipProtocol {
     async fn handle_command(&self, command: Self::Command) -> Result<()> {
         match command {
             ChatGossipCommand::Join { topic, peers, endpoint, name } => {
+                // If we already have a subscription to this topic in this
+                // session (e.g. user clicked Leave Room and then rejoined),
+                // re-use it. Subscribing twice to the same topic in iroh-
+                // gossip leads to undefined mesh state and asymmetric
+                // delivery. We just re-emit Joined and re-broadcast our
+                // identity so the existing mesh learns we're back.
+                let already = self
+                    .topics
+                    .lock()
+                    .expect("topics mutex poisoned")
+                    .get(&topic)
+                    .cloned();
+                if let Some(existing_sender) = already {
+                    let _ = self.events_tx.send(ChatGossipEvent::Joined { topic: topic.clone() });
+                    broadcast_wire(
+                        &existing_sender,
+                        ChatWireMessage::AboutMe { endpoint, name },
+                    )
+                    .await?;
+                    // Re-Sync so we repopulate any state we lost on Leave.
+                    let _ = broadcast_wire(&existing_sender, ChatWireMessage::Sync).await;
+                    return Ok(());
+                }
                 let topic_id = parse_topic(&topic)?;
                 let peers = parse_peers(&peers)?;
                 let gossip = self.existing_gossip()?;
@@ -134,6 +173,9 @@ impl BrowserProtocol for ChatGossipProtocol {
                 let sender_for_task = sender.clone();
                 let endpoint_for_task = endpoint.clone();
                 let name_for_task = name.clone();
+                // Coalesces Sync responses: at most one pending re-announce
+                // per topic at a time, no matter how many Syncs arrive.
+                let pending_announce = Arc::new(AtomicBool::new(false));
                 task::spawn(async move {
                     while let Some(event) = receiver.next().await {
                         match event {
@@ -187,6 +229,29 @@ impl BrowserProtocol for ChatGossipProtocol {
                                                 text,
                                             });
                                         }
+                                        ChatWireMessage::Sync => {
+                                            // Schedule a jittered re-announce. The
+                                            // pending flag coalesces multiple Syncs
+                                            // into one response.
+                                            if pending_announce
+                                                .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                                                .is_ok()
+                                            {
+                                                let ep = endpoint_for_task.clone();
+                                                let nm = name_for_task.clone();
+                                                let snd = sender_for_task.clone();
+                                                let pending = pending_announce.clone();
+                                                task::spawn(async move {
+                                                    let jitter_ms = jitter_for(&ep);
+                                                    n0_future::time::sleep(Duration::from_millis(jitter_ms)).await;
+                                                    let _ = broadcast_wire(
+                                                        &snd,
+                                                        ChatWireMessage::AboutMe { endpoint: ep, name: nm },
+                                                    ).await;
+                                                    pending.store(false, Ordering::SeqCst);
+                                                });
+                                            }
+                                        }
                                         ChatWireMessage::Unknown => {} // forward-compat no-op
                                     }
                                 }
@@ -213,6 +278,9 @@ impl BrowserProtocol for ChatGossipProtocol {
                 });
                 let _ = self.events_tx.send(ChatGossipEvent::Joined { topic: topic.clone() });
                 broadcast_wire(&sender, ChatWireMessage::AboutMe { endpoint, name }).await?;
+                // Ask everyone in the topic to re-announce themselves so we
+                // populate our name map without periodic keepalive traffic.
+                let _ = broadcast_wire(&sender, ChatWireMessage::Sync).await;
             }
             ChatGossipCommand::Send { topic, from_endpoint, from_name, text } => {
                 let sender = self
@@ -252,6 +320,16 @@ impl ChatGossipProtocol {
             .clone()
             .ok_or_else(|| Error::WebRtc("gossip not yet registered".into()))
     }
+}
+
+/// Deterministic per-endpoint jitter in milliseconds, in [0, 3000).
+/// Spreads Sync responses out so peers don't all reply at the same instant.
+fn jitter_for(endpoint: &str) -> u64 {
+    let mut h: u32 = 0;
+    for b in endpoint.bytes() {
+        h = h.wrapping_mul(31).wrapping_add(b as u32);
+    }
+    (h as u64) % 3000
 }
 
 async fn broadcast_wire(sender: &GossipSender, msg: ChatWireMessage) -> Result<()> {

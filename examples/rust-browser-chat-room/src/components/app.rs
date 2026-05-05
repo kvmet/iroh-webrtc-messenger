@@ -92,6 +92,9 @@ pub(crate) fn app() -> Html {
                             spawn_local(async move {
                                 gossip_event_loop(gossip, ep, state).await;
                             });
+                            // Peer discovery is event-driven — see the
+                            // ChatWireMessage docs in protocol.rs. No
+                            // periodic heartbeat task needed here.
                             phase.set(AppPhase::Ready);
                         }
                         Err(e) => {

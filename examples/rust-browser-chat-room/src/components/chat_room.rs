@@ -238,6 +238,29 @@ pub(crate) fn chat_room(props: &ChatRoomProps) -> Html {
         })
     };
 
+    let titlebar_right = match active_room {
+        Some(room) => {
+            let active = room.participants.len();
+            let known = room.bootstrap_peers.len();
+            let dot = if active == 0 && known == 0 {
+                "text-gray-300"
+            } else if active == 0 {
+                "text-red-400"
+            } else if active < known {
+                "text-yellow-300"
+            } else {
+                "text-green-400"
+            };
+            html! {
+                <>
+                    <span class={dot} title={format!("{active} active / {known} known")}>{"●"}</span>
+                    <span>{format!("#{} {}/{}", room.name, active, known)}</span>
+                </>
+            }
+        }
+        None => html! { <span>{"WebRTC P2P"}</span> },
+    };
+
     html! {
         <div class="aim-window flex flex-col h-full">
             <div class="aim-titlebar">
@@ -246,8 +269,8 @@ pub(crate) fn chat_room(props: &ChatRoomProps) -> Html {
                     {"☰"}
                 </button>
                 {"🔵 Iroh Messenger"}
-                <span class="ml-auto font-normal opacity-75 text-[10px] truncate">
-                    { active_room.map_or_else(|| "WebRTC P2P".into(), |r| format!("#{}", r.name)) }
+                <span class="ml-auto font-normal opacity-75 text-[10px] truncate flex items-center gap-1">
+                    { titlebar_right }
                 </span>
             </div>
 
