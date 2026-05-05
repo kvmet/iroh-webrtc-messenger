@@ -44,6 +44,7 @@ pub(crate) struct AppState {
 pub(crate) enum Action {
     SetInitial(AppState),
     AddRoom(RoomState),
+    RemoveRoom(String),
     SetActive(String),
     LocalSend { topic: String, msg: ChatMsg },
     Joined(String),
@@ -68,6 +69,12 @@ impl Reducible for AppState {
                 } else {
                     s.active_topic = Some(r.topic_id.clone());
                     s.rooms.push(r);
+                }
+            }
+            Action::RemoveRoom(topic) => {
+                s.rooms.retain(|r| r.topic_id != topic);
+                if s.active_topic.as_deref() == Some(topic.as_str()) {
+                    s.active_topic = s.rooms.first().map(|r| r.topic_id.clone());
                 }
             }
             Action::SetActive(topic) => {

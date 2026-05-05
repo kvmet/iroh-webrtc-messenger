@@ -89,6 +89,22 @@ pub(crate) fn make_qr_svg(text: &str) -> Option<String> {
     )
 }
 
+/// Trigger a browser download of `content` as `filename`. Uses a data URL
+/// + synthetic anchor click — no extra web-sys features needed.
+pub(crate) fn download_text(filename: &str, content: &str) {
+    let Some(window) = web_sys::window() else { return };
+    let Some(doc) = window.document() else { return };
+    let Ok(el) = doc.create_element("a") else { return };
+    let encoded = js_sys::encode_uri_component(content)
+        .as_string()
+        .unwrap_or_default();
+    let data_url = format!("data:application/json;charset=utf-8,{}", encoded);
+    let _ = el.set_attribute("href", &data_url);
+    let _ = el.set_attribute("download", filename);
+    let a: web_sys::HtmlElement = el.unchecked_into();
+    a.click();
+}
+
 pub(crate) fn copy_to_clipboard(text: &str) {
     let text = text.to_string();
     spawn_local(async move {

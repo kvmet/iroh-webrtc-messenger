@@ -6,8 +6,8 @@ use web_sys::{HtmlElement, HtmlInputElement, HtmlTextAreaElement};
 use yew::prelude::*;
 
 use crate::state::{AppState, RoomMode};
-use crate::storage::{save_name, save_profile};
-use crate::util::{copy_to_clipboard, make_invite_url, make_qr_svg, parse_invite};
+use crate::storage::{export_backup, save_name, save_profile};
+use crate::util::{copy_to_clipboard, download_text, make_invite_url, make_qr_svg, parse_invite};
 
 #[derive(Properties, PartialEq)]
 pub(crate) struct ChatRoomProps {
@@ -23,6 +23,7 @@ pub(crate) struct ChatRoomProps {
     pub(crate) on_join: Callback<(String, String, String)>,     // (invite, room_name, screen_name)
     pub(crate) on_send: Callback<(String, String, String)>,     // (text, name, topic_id)
     pub(crate) on_switch_room: Callback<String>,                // topic_id
+    pub(crate) on_leave_room: Callback<String>,                 // topic_id
     pub(crate) on_clear_error: Callback<()>,
 }
 
@@ -45,6 +46,7 @@ pub(crate) fn chat_room(props: &ChatRoomProps) -> Html {
     let show_host_modal = use_state(|| false);
     let show_join_modal = use_state(|| false);
     let open_menu: UseStateHandle<Option<String>> = use_state(|| None);
+    let confirm_leave: UseStateHandle<Option<String>> = use_state(|| None);
     let qr_url: UseStateHandle<Option<String>> = use_state(|| None);
     let sidebar_open = use_state(|| false);
 
@@ -376,6 +378,17 @@ pub(crate) fn chat_room(props: &ChatRoomProps) -> Html {
                         <div class="aim-section-label">{"Screen Name"}</div>
                         <input type="text" class="aim-input" value={(*name).clone()}
                             oninput={on_name_input} maxlength="32" />
+                        if props.persistent {
+                            <button
+                                class="mt-2 text-[10px] text-blue-700 underline cursor-pointer bg-transparent border-0 p-0"
+                                onclick={Callback::from(|_: MouseEvent| {
+                                    if let Some(json) = export_backup() {
+                                        download_text("iroh-messenger-backup.json", &json);
+                                    }
+                                })}>
+                                {"Export backup"}
+                            </button>
+                        }
                     </div>
 
                     <div class="p-2 border-b border-[#808080] flex gap-1">
@@ -442,23 +455,56 @@ pub(crate) fn chat_room(props: &ChatRoomProps) -> Html {
                                                 </div>
                                                 if open_menu.as_deref() == Some(room.topic_id.as_str()) {
                                                     <div class="aim-window absolute right-0 min-w-[160px]" style="top:100%;z-index:30">
-                                                        <button class="block w-full text-left px-3 py-2 text-sm hover:bg-[#000080] hover:text-white"
-                                                            onclick={Callback::from({
-                                                                let url = invite_url.clone();
-                                                                let om = open_menu.clone();
-                                                                move |_: MouseEvent| { copy_to_clipboard(&url); om.set(None); }
-                                                            })}>
-                                                            {"Copy invite link"}
-                                                        </button>
-                                                        <button class="block w-full text-left px-3 py-2 text-sm hover:bg-[#000080] hover:text-white"
-                                                            onclick={Callback::from({
-                                                                let url = invite_url.clone();
-                                                                let om = open_menu.clone();
-                                                                let qr = qr_url.clone();
-                                                                move |_: MouseEvent| { qr.set(Some(url.clone())); om.set(None); }
-                                                            })}>
-                                                            {"Show QR code"}
-                                                        </button>
+                                                        if confirm_leave.as_deref() == Some(room.topic_id.as_str()) {
+                                                            <div class="px-3 py-2 text-xs">{format!("Leave #{}?", room.name)}</div>
+                                                            <button class="block w-full text-left px-3 py-2 text-sm hover:bg-[#000080] hover:text-white"
+                                                                onclick={Callback::from({
+                                                                    let leave_cb = props.on_leave_room.clone();
+                                                                    let tid = room.topic_id.clone();
+                                                                    let om = open_menu.clone();
+                                                                    let cl = confirm_leave.clone();
+                                                                    move |_: MouseEvent| {
+                                                                        leave_cb.emit(tid.clone());
+                                                                        cl.set(None);
+                                                                        om.set(None);
+                                                                    }
+                                                                })}>
+                                                                {"Yes, leave"}
+                                                            </button>
+                                                            <button class="block w-full text-left px-3 py-2 text-sm hover:bg-[#000080] hover:text-white"
+                                                                onclick={Callback::from({
+                                                                    let cl = confirm_leave.clone();
+                                                                    move |_: MouseEvent| cl.set(None)
+                                                                })}>
+                                                                {"Cancel"}
+                                                            </button>
+                                                        } else {
+                                                            <button class="block w-full text-left px-3 py-2 text-sm hover:bg-[#000080] hover:text-white"
+                                                                onclick={Callback::from({
+                                                                    let url = invite_url.clone();
+                                                                    let om = open_menu.clone();
+                                                                    move |_: MouseEvent| { copy_to_clipboard(&url); om.set(None); }
+                                                                })}>
+                                                                {"Copy invite link"}
+                                                            </button>
+                                                            <button class="block w-full text-left px-3 py-2 text-sm hover:bg-[#000080] hover:text-white"
+                                                                onclick={Callback::from({
+                                                                    let url = invite_url.clone();
+                                                                    let om = open_menu.clone();
+                                                                    let qr = qr_url.clone();
+                                                                    move |_: MouseEvent| { qr.set(Some(url.clone())); om.set(None); }
+                                                                })}>
+                                                                {"Show QR code"}
+                                                            </button>
+                                                            <button class="block w-full text-left px-3 py-2 text-sm hover:bg-[#000080] hover:text-white text-red-700"
+                                                                onclick={Callback::from({
+                                                                    let cl = confirm_leave.clone();
+                                                                    let tid = room.topic_id.clone();
+                                                                    move |_: MouseEvent| cl.set(Some(tid.clone()))
+                                                                })}>
+                                                                {"Leave room"}
+                                                            </button>
+                                                        }
                                                     </div>
                                                 }
                                             </li>

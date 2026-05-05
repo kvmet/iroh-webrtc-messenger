@@ -1,8 +1,70 @@
 use iroh::SecretKey;
-use web_sys::HtmlInputElement;
+use web_sys::{HtmlInputElement, HtmlTextAreaElement};
 use yew::prelude::*;
 
-use crate::storage::{save_name, stored_name};
+use crate::storage::{import_backup, save_name, stored_name};
+
+fn reload_page() {
+    if let Some(window) = web_sys::window() {
+        let _ = window.location().reload();
+    }
+}
+
+#[function_component(ImportPanel)]
+fn import_panel() -> Html {
+    let open = use_state(|| false);
+    let text = use_state(String::new);
+    let error: UseStateHandle<Option<String>> = use_state(|| None);
+
+    let on_text = {
+        let text = text.clone();
+        Callback::from(move |e: InputEvent| {
+            let el: HtmlTextAreaElement = e.target_unchecked_into();
+            text.set(el.value());
+        })
+    };
+    let on_toggle = {
+        let open = open.clone();
+        Callback::from(move |_: MouseEvent| open.set(!*open))
+    };
+    let on_restore = {
+        let text = text.clone();
+        let error = error.clone();
+        Callback::from(move |_: MouseEvent| {
+            match import_backup(&text) {
+                Ok(()) => reload_page(),
+                Err(msg) => error.set(Some(msg)),
+            }
+        })
+    };
+
+    html! {
+        <>
+            <button
+                class="mt-2 block text-xs text-blue-700 underline cursor-pointer bg-transparent border-0 p-0"
+                onclick={on_toggle}
+            >
+                { if *open { "Cancel restore" } else { "Restore from backup" } }
+            </button>
+            if *open {
+                <div class="mt-2">
+                    <p class="text-[10px] text-gray-600 mb-1">
+                        {"Paste the contents of your backup JSON file. You'll still need your passphrase."}
+                    </p>
+                    <textarea
+                        class="aim-inset w-full h-20 p-1 text-[10px] font-mono resize-none"
+                        value={(*text).clone()}
+                        oninput={on_text}
+                    />
+                    if let Some(e) = (*error).clone() {
+                        <div class="text-[11px] text-red-700 mt-1">{e}</div>
+                    }
+                    <button class="aim-btn w-full mt-2" onclick={on_restore}>{"Restore"}</button>
+                </div>
+            }
+        </>
+    }
+}
 
 // ── PassphraseGate ────────────────────────────────────────────────────────────
 
@@ -103,6 +165,7 @@ pub(crate) fn passphrase_gate(props: &PassphraseGateProps) -> Html {
                     >
                         {"Sign in for this session only (ephemeral)"}
                     </button>
+                    <ImportPanel />
                     <button
                         class="mt-2 block text-xs text-red-700 underline cursor-pointer bg-transparent border-0 p-0"
                         onclick={on_forget_click}
@@ -196,6 +259,7 @@ pub(crate) fn new_user_setup(props: &NewUserSetupProps) -> Html {
                         {"Without a passphrase your identity and chats are not saved. You will get a new handle every session."}
                     </p>
                     <button class="aim-btn w-full" onclick={on_go}>{"Create & Sign On"}</button>
+                    <ImportPanel />
                 </div>
             </div>
         </div>

@@ -221,8 +221,14 @@ pub(crate) fn app() -> Html {
                         chat_state.dispatch(Action::SetActive(topic_id));
                     })
                 };
+                let on_leave_room = {
+                    let chat_state = chat_state.clone();
+                    Callback::from(move |topic_id: String| {
+                        chat_state.dispatch(Action::RemoveRoom(topic_id));
+                    })
+                };
                 html! {
-                    <ChatRoom {endpoint_id} {state} {key_bytes} {persistent} ephemeral={is_ephemeral} {initial_name} {on_host} {on_join} {on_send} {on_switch_room} {on_clear_error} />
+                    <ChatRoom {endpoint_id} {state} {key_bytes} {persistent} ephemeral={is_ephemeral} {initial_name} {on_host} {on_join} {on_send} {on_switch_room} {on_leave_room} {on_clear_error} />
                 }
             } else {
                 html! { <div class="p-4 text-red-600">{"Error: node handle missing"}</div> }

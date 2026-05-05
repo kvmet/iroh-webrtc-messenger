@@ -154,3 +154,70 @@ pub(crate) async fn load_profile(key_bytes: &[u8; 32]) -> Profile {
     let Ok(json) = decrypt_data(&enc, key_bytes).await else { return Profile::default() };
     serde_json::from_slice(&json).unwrap_or_default()
 }
+
+// ── Backup export / import ────────────────────────────────────────────────────
+
+/// On-disk backup file format. **Stability contract**: same as Profile —
+/// never remove or rename a field, add new ones with `#[serde(default)]`,
+/// bump version only for restructures.
+#[derive(Serialize, Deserialize)]
+struct Backup {
+    #[serde(default)]
+    format: String,
+    #[serde(default = "backup_version_default")]
+    version: u32,
+    /// base64 of the raw `iroh.id.enc` localStorage value (already
+    /// versioned + encrypted by the crypto layer).
+    #[serde(default)]
+    id_enc: String,
+    #[serde(default)]
+    id_salt: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    profile: Option<String>,
+}
+
+fn backup_version_default() -> u32 { 1 }
+
+const BACKUP_FORMAT_TAG: &str = "iroh-messenger-backup";
+
+/// Pull the encrypted identity (and profile, if any) out of localStorage
+/// as a self-contained JSON document. Returns None if there's nothing
+/// persisted to back up.
+pub(crate) fn export_backup() -> Option<String> {
+    let s = local_storage().ok()?;
+    let id_enc = s.get_item(STORAGE_ENC).ok().flatten()?;
+    let id_salt = s.get_item(STORAGE_SALT).ok().flatten()?;
+    let profile = s.get_item(STORAGE_PROFILE).ok().flatten();
+    let backup = Backup {
+        format: BACKUP_FORMAT_TAG.into(),
+        version: 1,
+        id_enc,
+        id_salt,
+        profile,
+    };
+    serde_json::to_string_pretty(&backup).ok()
+}
+
+/// Write a backup JSON document into localStorage. The user still needs
+/// their original passphrase to actually unlock the imported identity.
+pub(crate) fn import_backup(json: &str) -> Result<(), String> {
+    let backup: Backup = serde_json::from_str(json).map_err(|e| format!("invalid backup: {e}"))?;
+    if backup.format != BACKUP_FORMAT_TAG {
+        return Err("not a recognized backup file".into());
+    }
+    if backup.version > 1 {
+        return Err(format!("unsupported backup version {}", backup.version));
+    }
+    if backup.id_enc.is_empty() || backup.id_salt.is_empty() {
+        return Err("backup is missing identity data".into());
+    }
+    let s = local_storage().map_err(|_| "localStorage unavailable".to_string())?;
+    s.set_item(STORAGE_ENC, &backup.id_enc).map_err(|_| "write failed".to_string())?;
+    s.set_item(STORAGE_SALT, &backup.id_salt).map_err(|_| "write failed".to_string())?;
+    if let Some(p) = backup.profile {
+        s.set_item(STORAGE_PROFILE, &p).map_err(|_| "write failed".to_string())?;
+    } else {
+        let _ = s.remove_item(STORAGE_PROFILE);
+    }
+    Ok(())
+}
